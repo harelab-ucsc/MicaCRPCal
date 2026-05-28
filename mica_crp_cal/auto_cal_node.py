@@ -209,8 +209,10 @@ class AutoCalNode(Node):
             Bool, "/cal/exposure_locked", _LATCHED_QOS
         )
 
-        # SetParameters service clients for each camera
-        self._clients = {
+        # SetParameters service clients for each camera.
+        # NOTE: named _param_clients, NOT _clients — rclpy.Node uses self._clients
+        # internally to track all service clients; shadowing it breaks the executor.
+        self._param_clients = {
             "cam0": self.create_client(
                 SetParameters, "/cam0/camera_node/set_parameters"
             ),
@@ -318,7 +320,7 @@ class AutoCalNode(Node):
         The executor (MultiThreadedExecutor, main thread) will process the
         service response and resolve the future; this thread polls until done.
         """
-        client = self._clients[cam]
+        client = self._param_clients[cam]
         if not client.wait_for_service(timeout_sec=timeout):
             self.get_logger().error(
                 f"{cam}: set_parameters service unavailable"
