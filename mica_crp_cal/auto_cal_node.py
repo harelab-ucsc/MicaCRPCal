@@ -335,7 +335,28 @@ class AutoCalNode(Node):
                 self.get_logger().error(f"{cam}: set_parameters timed out")
                 return False
             time.sleep(0.01)
-        return future.result() is not None
+        result = future.result()
+        if result is None:
+            return False
+        rejected = [
+            (p.name, r.reason)
+            for p, r in zip(params, result.results)
+            if not r.successful
+        ]
+        if rejected:
+            sep = "=" * 62
+            details = "".join(f"    {name}: {reason}\n" for name, reason in rejected)
+            self.get_logger().error(
+                f"\n{sep}\n"
+                f"  CAMERA PARAMETER UPDATE REJECTED — {cam}\n"
+                f"  The camera driver refused the following settings:\n"
+                f"{details}"
+                f"  Binary search frame may have been captured at the WRONG\n"
+                f"  exposure. Increase SETTLE_FRAMES if this recurs.\n"
+                f"{sep}"
+            )
+            return False
+        return True
 
     # -----------------------------------------------------------------------
     # Frame acquisition (blocks the calling background thread)
