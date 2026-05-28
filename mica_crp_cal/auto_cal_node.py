@@ -172,11 +172,13 @@ class AutoCalNode(Node):
         self._bridge = CvBridge()
 
         # Altitude gate — set immediately if force_cal is True.
-        # Declared as bool but ROS2 launch passes LaunchConfiguration values as
-        # strings ("true"/"false"), so coerce explicitly to handle both types.
-        self.declare_parameter("force_cal", False)
-        _fc = self.get_parameter("force_cal").value
-        self._force_cal: bool = _fc if isinstance(_fc, bool) else str(_fc).lower() == "true"
+        # Declared as a string because ROS2 launch evaluates LaunchConfiguration
+        # substitutions to strings ("true"/"false"); declaring as bool causes a
+        # type mismatch that silently falls back to the default False.
+        self.declare_parameter("force_cal", "false")
+        self._force_cal: bool = (
+            self.get_parameter("force_cal").value.lower() == "true"
+        )
         self._above_alt = threading.Event()
         self._alt_notified = False  # log the crossing only once
         if self._force_cal:
