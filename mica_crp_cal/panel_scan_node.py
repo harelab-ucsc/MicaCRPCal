@@ -240,11 +240,13 @@ class PanelScanNode(Node):
         for s in range(NUM_SLICES):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
             gray = (band >> 8).astype(np.uint8) if raw.dtype != np.uint8 else band.copy()
-            data, bbox, _ = self._detector.detectAndDecode(gray)
-            if data:
+            # Use detect() (location only) instead of detectAndDecode() so that
+            # QR detection works even when OpenCV is built without QUIRC.
+            found, bbox = self._detector.detect(gray)
+            if found and bbox is not None:
                 bboxes.append(bbox)
                 detected_slices.append(s)
-                detected_data = data
+                detected_data = True
             else:
                 bboxes.append(None)
 
@@ -253,8 +255,8 @@ class PanelScanNode(Node):
             self._last_raw = raw
             self._last_bboxes = bboxes
             self.get_logger().info(
-                f"QR detected in slice(s) {detected_slices} "
-                f"({self._confirm}/{CONFIRM_FRAMES}): '{detected_data}'"
+                f"QR located in slice(s) {detected_slices} "
+                f"({self._confirm}/{CONFIRM_FRAMES})"
             )
             if self._confirm >= CONFIRM_FRAMES:
                 self._publish_calibration()
