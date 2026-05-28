@@ -175,6 +175,7 @@ class AutoCalNode(Node):
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
         self._above_alt = threading.Event()
+        self._alt_notified = False  # log the crossing only once
         if self._force_cal:
             self._above_alt.set()
             self.get_logger().warn(
@@ -277,6 +278,12 @@ class AutoCalNode(Node):
 
     def _radalt_cb(self, msg) -> None:
         if msg.altitude > ALT_THRESHOLD_M:
+            if not self._alt_notified:
+                self._alt_notified = True
+                self.get_logger().info(
+                    f"[AUTO-CAL] altitude gate cleared ({msg.altitude:.1f} m AGL >= "
+                    f"{ALT_THRESHOLD_M} m threshold) — triggering calibration"
+                )
             self._above_alt.set()
 
     def _cam0_cb(self, msg: Image) -> None:
@@ -460,8 +467,13 @@ class AutoCalNode(Node):
                 "exposure and irradiance calibration have NOT run yet. "
                 "Cameras are in auto-exposure mode."
             )
+        sep = "=" * 62
         self.get_logger().info(
-            f"Drone above {ALT_THRESHOLD_M} m — starting auto-calibration"
+            f"\n{sep}\n"
+            f"  AUTO-CALIBRATION STARTING\n"
+            f"  Drone cleared {ALT_THRESHOLD_M} m AGL — locking cam0 + cam1 exposure\n"
+            f"  Images will NOT be saved until this completes.\n"
+            f"{sep}"
         )
 
         # Calibrate cam0 and cam1 sequentially (independent cameras, different lenses).
@@ -497,10 +509,16 @@ class AutoCalNode(Node):
 
         # Signal panel_scan that exposure is locked and it can start imaging.
         self._pub_exposure_locked.publish(Bool(data=True))
+        sep = "=" * 62
         self.get_logger().info(
-            "Exposure locked — panel_scan may now begin QR detection."
+            f"\n{sep}\n"
+            f"  AUTO-CALIBRATION COMPLETE\n"
+            f"  Both cameras locked at flight exposure.\n"
+            f"  /panel_cal/spec_ref published — stream_processor will now\n"
+            f"  save and spectral-correct images.\n"
+            f"  panel_scan QR window is now open.\n"
+            f"{sep}"
         )
-        self.get_logger().info("Auto-calibration complete.")
         rclpy.shutdown()
 
 
