@@ -50,7 +50,6 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
 
-SCAN_TIMEOUT_S = 30.0
 CONFIRM_FRAMES = 3
 NUM_SLICES = 4
 
@@ -140,11 +139,9 @@ class PanelScanNode(Node):
         # Exposure-lock gate: QR scanning only starts once auto_cal has locked
         # the cameras. mean_panel_DN encodes ExposureTime — scanning before lock
         # would produce factors calibrated at a different exposure than flight.
-        # _scan_start is set to monotonic time when the gate opens.
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
         self._exposure_locked: bool = self._force_cal
-        self._scan_start: float | None = time.monotonic() if self._force_cal else None
 
         # CRP albedo CSV — can be overridden via ROS parameter.
         self.declare_parameter("crp_csv", str(_DEFAULT_CSV))
@@ -184,7 +181,7 @@ class PanelScanNode(Node):
             _LATCHED_QOS,
         )
 
-        self.create_timer(5.0, self._watchdog)
+        self.create_timer(2.0, self._watchdog)
 
         if self._force_cal:
             self.get_logger().warn(
@@ -209,9 +206,8 @@ class PanelScanNode(Node):
         if self._exposure_locked:
             return
         self._exposure_locked = True
-        self._scan_start = time.monotonic()
         self.get_logger().info(
-            f"Exposure locked — opening {SCAN_TIMEOUT_S:.0f} s panel scan window. "
+            "Exposure locked — panel scan window open. "
             "Place the CRP panel flat on the ground directly below the drone "
             "with the QR tag visible. Panel must be in direct sunlight with "
             "NO shadow on the reflective surface."
@@ -274,13 +270,11 @@ class PanelScanNode(Node):
                 "/cal/exposure_locked — QR scan has not started yet."
             )
             return
-        if self._scan_start is not None and \
-                time.monotonic() - self._scan_start >= SCAN_TIMEOUT_S:
-            self.get_logger().warn(
-                "Panel scan timed out — no QR tag confirmed. "
-                "stream_processor will use factor=1.0 (no spectral correction)."
-            )
-            rclpy.shutdown()
+        self.get_logger().warn(
+            "panel_scan: QR tag not yet detected — still scanning. "
+            "Ensure the CRP panel is flat below the drone, QR tag visible, "
+            "in direct sunlight with no shadow."
+        )
 
     # ------------------------------------------------------------------
     # Calibration factor computation
