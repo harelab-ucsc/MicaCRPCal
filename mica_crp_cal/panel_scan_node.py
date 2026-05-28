@@ -141,8 +141,11 @@ class PanelScanNode(Node):
         # the cameras. mean_panel_DN encodes ExposureTime — scanning before lock
         # would produce factors calibrated at a different exposure than flight.
         # _scan_start is set to monotonic time when the gate opens.
+        # Declared as bool but ROS2 launch passes LaunchConfiguration values as
+        # strings ("true"/"false"), so coerce explicitly to handle both types.
         self.declare_parameter("force_cal", False)
-        self._force_cal: bool = self.get_parameter("force_cal").value
+        _fc = self.get_parameter("force_cal").value
+        self._force_cal: bool = _fc if isinstance(_fc, bool) else str(_fc).lower() == "true"
         self._exposure_locked: bool = self._force_cal
         self._scan_start: float | None = time.monotonic() if self._force_cal else None
 
