@@ -46,7 +46,8 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-import zxingcpp
+# No extra QR library needed — cv2.QRCodeDetectorAruco is built into OpenCV 4.5+
+# and handles perspective distortion much better than QRCodeDetector.
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
@@ -200,6 +201,7 @@ class PanelScanNode(Node):
     def __init__(self):
         super().__init__("panel_scan")
         self._bridge = CvBridge()
+        self._detector = cv2.QRCodeDetectorAruco()
         self._window: deque = deque(maxlen=WINDOW_SIZE)  # sliding detection window
         self._done = False
         self._last_raw: np.ndarray | None = None
@@ -335,24 +337,16 @@ class PanelScanNode(Node):
             gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if raw.dtype != np.uint8 else band.copy()
             try:
-                results = zxingcpp.read_barcodes(gray, formats=zxingcpp.BarcodeFormat.QRCode)
+                data, bbox, _ = self._detector.detectAndDecode(gray)
             except Exception as e:
-                self.get_logger().error(f"zxingcpp decode failed on slice {s}: {e}")
-                results = []
-            if results:
-                r = results[0]
-                # ZXing position gives 4 corners as ResultPoint objects.
-                pos = r.position
-                pts = np.array([
-                    [pos.top_left.x,     pos.top_left.y],
-                    [pos.top_right.x,    pos.top_right.y],
-                    [pos.bottom_right.x, pos.bottom_right.y],
-                    [pos.bottom_left.x,  pos.bottom_left.y],
-                ], dtype=np.float32)
+                self.get_logger().error(f"QR detect failed on slice {s}: {e}")
+                data, bbox = "", None
+            if data and bbox is not None:
+                pts = bbox.reshape(4, 2).astype(np.float32)
                 if qr_corners is None:
                     qr_corners = pts
                 detected_slices.append(s)
-                self.get_logger().debug(f"Slice {s}: QR decoded — '{r.text}'")
+                self.get_logger().debug(f"Slice {s}: QR decoded — '{data}'")
 
         # Build bboxes for all slices using the shared corners.
         bboxes: list[np.ndarray | None] = [
