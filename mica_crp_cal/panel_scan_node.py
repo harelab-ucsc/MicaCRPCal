@@ -564,6 +564,7 @@ class PanelScanNode(Node):
             vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             vis_bgr = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
+            qr_pts = self._last_qr_pts
             panel_proj = _panel_roi_from_qr(qr_pts)
             for i in range(NUM_SLICES):
                 x_off = i * slice_w

@@ -66,7 +66,7 @@ ALT_THRESHOLD_M = 6.0
 
 # Exposure: 5 ms gives < 1 px motion smear at 5 m/s with 0.03 m/px GSD.
 MAX_EXPOSURE_US = 5_000
-MIN_EXPOSURE_US = 100
+MIN_EXPOSURE_US = 1000  # cam1 rejects values below ~1000 µs (integer range)
 
 # Gain: try these levels in order, stepping up only when MAX_EXPOSURE is not
 # enough to satisfy DARK_FLOOR. Higher gain → more analogue noise.
