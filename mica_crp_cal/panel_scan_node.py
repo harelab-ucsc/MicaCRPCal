@@ -291,6 +291,17 @@ class PanelScanNode(Node):
             )
             return
 
+        # Save the very first frame so the user can verify image quality.
+        if not self._window:
+            try:
+                import os
+                vis = (raw >> 8).astype(np.uint8)
+                out = os.path.join(os.path.expanduser("~/parsed_flight"), "panel_scan_first_frame.png")
+                cv2.imwrite(out, vis)
+                self.get_logger().info(f"First scan frame saved: {out}")
+            except Exception as e:
+                self.get_logger().warn(f"Could not save first frame: {e}")
+
         h, w = raw.shape[:2]
         slice_w = w // NUM_SLICES
 
