@@ -383,7 +383,61 @@ class PanelScanNode(Node):
         self.get_logger().info(
             f"Panel calibration published ({NUM_SLICES} bands) on /panel_cal/irradiance"
         )
+
+        self._save_debug_image(raw, bboxes, factors, slice_w, fallback_idx)
         rclpy.shutdown()
+
+    def _save_debug_image(
+        self,
+        raw: np.ndarray,
+        bboxes: list,
+        factors: list,
+        slice_w: int,
+        fallback_idx: int,
+    ) -> None:
+        """Save an 8-bit BGR image with QR and panel ROI boxes drawn per slice."""
+        try:
+            import os
+
+            # Normalise 16-bit → 8-bit and convert to BGR for drawing.
+            vis = (raw >> 8).astype(np.uint8)
+            vis_bgr = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+            fallback_pts = next(b.reshape(4, 2).astype(np.float32) for b in bboxes if b is not None)
+
+            for i in range(NUM_SLICES):
+                x_off = i * slice_w
+
+                pts = bboxes[i].reshape(4, 2).astype(np.float32) if bboxes[i] is not None else fallback_pts
+                panel_pts = _panel_roi_from_qr(pts)
+
+                # Offset slice-local coords to full-image coords.
+                qr_global = pts.copy()
+                qr_global[:, 0] += x_off
+                panel_global = panel_pts.copy()
+                panel_global[:, 0] += x_off
+
+                qr_int = np.round(qr_global).astype(np.int32)
+                panel_int = np.round(panel_global).astype(np.int32)
+
+                # QR box: green. Panel ROI: blue.
+                cv2.polylines(vis_bgr, [qr_int], isClosed=True, color=(0, 255, 0), thickness=4)
+                cv2.polylines(vis_bgr, [panel_int], isClosed=True, color=(255, 80, 0), thickness=4)
+
+                label = f"{CAM0_BAND_NM[i]}nm  f={factors[i]:.3f}"
+                cv2.putText(
+                    vis_bgr, label,
+                    (x_off + 10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2,
+                )
+
+            out_dir = os.path.expanduser("~/parsed_flight")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "panel_cal_debug.png")
+            cv2.imwrite(out_path, vis_bgr)
+            self.get_logger().info(f"Debug image saved: {out_path}")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to save debug image: {e}")
 
 
 def main(args=None):
