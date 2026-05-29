@@ -81,7 +81,7 @@ MAX_ITERS = 8
 
 # How many frames to skip after a parameter change before sampling.
 # At 3 Hz one frame = 333 ms; skipping 1 gives ~333 ms settling time.
-SETTLE_FRAMES = 1
+SETTLE_FRAMES = 3
 
 _LATCHED_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -409,20 +409,28 @@ class AutoCalNode(Node):
                 f"gain={gain:.1f}  exposure range [{lo}, {hi}] µs"
             )
 
-            # Step 1: disable AE and set gain.
-            self._set_params(cam, [
+            # Step 1: disable AE and set gain. Use _settled_frame (not _next_frame)
+            # to drain buffered frames so the parameter lands on a fresh frame,
+            # not on one that was already queued before the request was sent.
+            self.get_logger().debug(f"{cam}: sending AeEnable=False, gain={gain:.1f}")
+            ok1 = self._set_params(cam, [
                 _param("AeEnable", False),
                 _param("AnalogueGain", gain),
             ])
-            self._next_frame(cam)  # wait for AeEnable to be committed
+            self.get_logger().debug(f"{cam}: AeEnable/gain set_params returned {ok1}, draining {SETTLE_FRAMES+1} frames")
+            self._settled_frame(cam)
 
-            # Step 2: AeEnable=False internally sets ExposureTimeMode=Manual,
-            # which then blocks ExposureTime updates. Clear it after it settles.
-            self._set_params(cam, [_param("ExposureTimeMode", 0)])
-            self._next_frame(cam)  # wait for ExposureTimeMode=0 to be committed
+            # Step 2: AeEnable=False internally activates ExposureTimeMode=Manual.
+            # Clear it after it settles so ExposureTime can be set.
+            self.get_logger().debug(f"{cam}: sending ExposureTimeMode=0")
+            ok2 = self._set_params(cam, [_param("ExposureTimeMode", 0)])
+            self.get_logger().debug(f"{cam}: ExposureTimeMode set_params returned {ok2}, draining {SETTLE_FRAMES+1} frames")
+            self._settled_frame(cam)
 
-            # Step 3: now ExposureTime can be set without conflict.
-            self._set_params(cam, [_param("ExposureTime", exposure)])
+            # Step 3: now set ExposureTime.
+            self.get_logger().debug(f"{cam}: sending ExposureTime={exposure}")
+            ok3 = self._set_params(cam, [_param("ExposureTime", exposure)])
+            self.get_logger().debug(f"{cam}: ExposureTime set_params returned {ok3}")
 
             bright_99 = dark_05 = 0.0
 
