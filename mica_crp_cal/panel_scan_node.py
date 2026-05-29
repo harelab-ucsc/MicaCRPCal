@@ -141,7 +141,10 @@ class PanelScanNode(Node):
         # would produce factors calibrated at a different exposure than flight.
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
-        self._exposure_locked: bool = self._force_cal
+        # Always wait for /cal/exposure_locked — even in force_cal mode.
+        # force_cal skips the altitude gate on auto_cal side, but the panel must
+        # still be scanned at the locked exposure or the factors will be wrong.
+        self._exposure_locked: bool = False
 
         # CRP albedo CSV — can be overridden via ROS parameter.
         self.declare_parameter("crp_csv", str(_DEFAULT_CSV))
@@ -185,8 +188,9 @@ class PanelScanNode(Node):
 
         if self._force_cal:
             self.get_logger().warn(
-                "force_cal=True — skipping exposure-lock gate and scanning "
-                "immediately. Only use this on the ground for testing."
+                "force_cal=True — still waiting for /cal/exposure_locked from "
+                "auto_cal before scanning. Panel scan always runs at the locked "
+                "exposure so factors are valid for flight images."
             )
             self.get_logger().warn(
                 "PRE-FLIGHT CHECK: The calibration panel MUST be in direct "
