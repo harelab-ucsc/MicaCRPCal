@@ -409,12 +409,16 @@ class AutoCalNode(Node):
                 f"gain={gain:.1f}  exposure range [{lo}, {hi}] µs"
             )
 
-            # Disable AE and seed the binary search.
+            # Disable AE and set gain — ExposureTime is NOT included here.
+            # camera_ros translates AeEnable=False into an ExposureTimeMode=Manual
+            # update internally; sending ExposureTime in the same request causes
+            # libcamera to reject it ("must not be set simultaneously"). Split
+            # into two calls so AeEnable settles before ExposureTime is applied.
             self._set_params(cam, [
                 _param("AeEnable", False),
-                _param("ExposureTime", exposure),
                 _param("AnalogueGain", gain),
             ])
+            self._set_params(cam, [_param("ExposureTime", exposure)])
 
             bright_99 = dark_05 = 0.0
 
