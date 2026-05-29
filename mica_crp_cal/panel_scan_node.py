@@ -308,16 +308,13 @@ class PanelScanNode(Node):
         h, w = raw.shape[:2]
         slice_w = w // NUM_SLICES
 
-        # Only run pyzbar on visible bands (695 nm = slice 1, 735 nm = slice 2).
-        # 450 nm (slice 0) has no indoor signal; 850 nm (slice 3) has poor ink
-        # contrast in NIR. Once corners are found in any detecting slice, the
-        # same corners are reused for all slices — each slice still measures its
-        # own DN in the shared panel ROI independently.
-        DETECT_SLICES = (1, 2)
+        # Run pyzbar on all slices. Whichever slice(s) detect the QR set the
+        # shared corners used for panel ROI projection across all slices.
+        # Which bands are "dark" depends on lighting — don't hardcode.
         qr_corners: np.ndarray | None = None
         detected_slices: list[int] = []
 
-        for s in DETECT_SLICES:
+        for s in range(NUM_SLICES):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
             gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if raw.dtype != np.uint8 else band.copy()
@@ -404,23 +401,17 @@ class PanelScanNode(Node):
             b.reshape(4, 2).astype(np.float32) for b in bboxes if b is not None
         )
 
+        # Project once — shared across all slices.
+        projected_panel = _panel_roi_from_qr(qr_pts)
+
         factors = []
         for i in range(NUM_SLICES):
-            if i not in DETECT_SLICES:
-                self.get_logger().info(
-                    f"Slice {i} ({CAM0_BAND_NM[i]} nm): skipped (dark band) — factor=1.0"
-                )
-                factors.append(1.0)
-                continue
-
             band = raw[:, i * slice_w: (i + 1) * slice_w]
 
-            projected_panel = _panel_roi_from_qr(qr_pts)
             band_u8 = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if band.dtype != np.uint8 else band
             panel_pts = _snap_to_corners(band_u8, projected_panel)
             panel_pts_int = np.round(panel_pts).astype(np.int32)
-            corners_note = ""
 
             mask = np.zeros(band.shape[:2], dtype=np.uint8)
             cv2.fillConvexPoly(mask, panel_pts_int, 255)
@@ -483,20 +474,15 @@ class PanelScanNode(Node):
             vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             vis_bgr = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
+            panel_proj = _panel_roi_from_qr(qr_pts)
             for i in range(NUM_SLICES):
                 x_off = i * slice_w
                 label = f"{CAM0_BAND_NM[i]}nm  f={factors[i]:.3f}"
                 cv2.putText(vis_bgr, label, (x_off + 10, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
-                if i not in DETECT_SLICES:
-                    continue  # no boxes for dark bands
-
-                pts = qr_pts
-                panel_pts = _panel_roi_from_qr(pts)
-
-                qr_global = pts.copy();  qr_global[:, 0] += x_off
-                panel_global = panel_pts.copy();  panel_global[:, 0] += x_off
+                qr_global = qr_pts.copy();  qr_global[:, 0] += x_off
+                panel_global = panel_proj.copy();  panel_global[:, 0] += x_off
 
                 cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
                               isClosed=True, color=(0, 255, 0), thickness=4)
