@@ -505,16 +505,14 @@ class PanelScanNode(Node):
             f"Panel calibration published ({NUM_SLICES} bands) on /panel_cal/irradiance"
         )
 
-        self._save_debug_image(raw, bboxes, factors, slice_w, fallback_idx)
+        self._save_debug_image(raw, factors, slice_w)
         rclpy.shutdown()
 
     def _save_debug_image(
         self,
         raw: np.ndarray,
-        bboxes: list,
         factors: list,
         slice_w: int,
-        fallback_idx: int,
     ) -> None:
         """Save an 8-bit BGR image with QR and panel ROI boxes drawn per slice."""
         try:
