@@ -323,13 +323,15 @@ class PanelScanNode(Node):
         h, w = raw.shape[:2]
         slice_w = w // NUM_SLICES
 
-        # Run pyzbar on all slices. Whichever slice(s) detect the QR set the
-        # shared corners used for panel ROI projection across all slices.
-        # Which bands are "dark" depends on lighting — don't hardcode.
+        # Run pyzbar on slices 1+2 (695nm, 735nm) — best ink contrast.
+        # Scanning all 4 slices per frame at 3Hz is too slow; 0=450nm and
+        # 3=850nm rarely detect and block the callback. The panel ROI is
+        # projected from the found corners and applied to all 4 slices at
+        # calibration time regardless of which slice detected here.
         qr_corners: np.ndarray | None = None
         detected_slices: list[int] = []
 
-        for s in range(NUM_SLICES):
+        for s in (1, 2):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
             gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if raw.dtype != np.uint8 else band.copy()
