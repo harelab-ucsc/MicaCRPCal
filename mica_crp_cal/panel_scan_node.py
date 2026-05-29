@@ -231,22 +231,17 @@ class PanelScanNode(Node):
     def __init__(self):
         super().__init__("panel_scan")
         self._bridge = CvBridge()
-        self._window: deque = deque(maxlen=WINDOW_SIZE)  # sliding detection window
+        self._window: deque = deque(maxlen=WINDOW_SIZE)
         self._frame_id: int = 0
+        self._first_frame_saved: bool = False
+        self._last_qr_pts = None  # corners from last confirmed detection
 
-        # QReader runs in a separate process so YOLO inference doesn't block
-        # the ROS executor and starve cam1/other subscriptions.
-        # MUST use 'spawn' not 'fork': fork copies FastDDS internal threads into
-        # the child which corrupts DDS state in the parent, killing cam1.
-        _ctx = mp.get_context('spawn')
-        self._qr_in: mp.Queue = _ctx.Queue(maxsize=2)   # drop stale frames
-        self._qr_out: mp.Queue = _ctx.Queue()
-        self._qr_proc = _ctx.Process(
-            target=_qreader_worker,
-            args=(self._qr_in, self._qr_out),
-            daemon=True,
-        )
-        self._qr_proc.start()
+        # QReader process — created lazily in _exposure_locked_cb so YOLO
+        # doesn't consume CPU during auto_cal's binary search.
+        self._qr_ctx = mp.get_context('spawn')
+        self._qr_in: mp.Queue | None = None
+        self._qr_out: mp.Queue | None = None
+        self._qr_proc = None
         self._done = False
         self._last_raw: np.ndarray | None = None
         self._last_bboxes: list[np.ndarray | None] = [None] * NUM_SLICES
@@ -335,6 +330,17 @@ class PanelScanNode(Node):
             return
         self._exposure_locked = True
         self._scan_open_t = time.monotonic()
+
+        # Start the QReader worker now — no point loading YOLO during auto_cal.
+        self._qr_in = self._qr_ctx.Queue(maxsize=2)
+        self._qr_out = self._qr_ctx.Queue()
+        self._qr_proc = self._qr_ctx.Process(
+            target=_qreader_worker,
+            args=(self._qr_in, self._qr_out),
+            daemon=True,
+        )
+        self._qr_proc.start()
+
         self.get_logger().info(
             "Exposure locked — panel scan window open. "
             "Place the CRP panel flat on the ground directly below the drone "
@@ -354,8 +360,9 @@ class PanelScanNode(Node):
             )
             return
 
-        # Save the very first frame so the user can verify image quality.
-        if not self._window:
+        # Save the very first frame after exposure lock so the user can verify quality.
+        if not self._first_frame_saved:
+            self._first_frame_saved = True
             try:
                 import os
                 vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -368,7 +375,9 @@ class PanelScanNode(Node):
         h, w = raw.shape[:2]
         slice_w = w // NUM_SLICES
 
-        # Run pyzbar on slices 1+2 (695nm, 735nm) — best ink contrast.
+        if self._qr_in is None:
+            return  # worker not started yet
+
         # Submit slices 1+2 to the QReader worker process (non-blocking).
         slices = []
         for s in (1, 2):
@@ -379,7 +388,7 @@ class PanelScanNode(Node):
         try:
             self._qr_in.put_nowait((self._frame_id, slices))
         except Exception:
-            pass  # queue full — skip this frame, worker is still busy
+            pass  # queue full — skip this frame
         self._frame_id += 1
 
         # Drain any completed results from the worker.
@@ -400,6 +409,7 @@ class PanelScanNode(Node):
             if hit:
                 self._last_raw = raw
                 self._last_bboxes = bboxes
+                self._last_qr_pts = qr_corners
                 self.get_logger().info(
                     f"QR located in slice(s) {detected_slices} "
                     f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
@@ -481,9 +491,7 @@ class PanelScanNode(Node):
 
         # Only calibrate slices that can see QR ink (DETECT_SLICES = 1, 2).
         # Dark/NIR bands (0=450nm, 3=850nm) get factor=1.0 — no projection.
-        qr_pts = next(
-            b.reshape(4, 2).astype(np.float32) for b in bboxes if b is not None
-        )
+        qr_pts = self._last_qr_pts
 
         # Project once — shared across all slices.
         projected_panel = _panel_roi_from_qr(qr_pts)
