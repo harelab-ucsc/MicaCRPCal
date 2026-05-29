@@ -61,11 +61,14 @@ NUM_SLICES = 4
 CAM0_BAND_NM = (450, 695, 735, 850)
 
 # Panel geometry relative to the QR bounding quad.
-# The flat panel is directly below the QR in the holder; both are the same size.
-# PANEL_GAP_FRAC: gap from QR bottom edge to panel top, as a fraction of QR height.
-# PANEL_SIZE_FRAC: panel height as a fraction of QR height (~1.0).
-PANEL_GAP_FRAC = 0.05
-PANEL_SIZE_FRAC = 1.0
+# Physical holder dimensions (RP06 CRP target):
+#   QR code:  83 mm × 83 mm
+#   Gap:      36 mm  (QR bottom edge to panel top)
+#   Panel:   100 mm × 100 mm
+# PANEL_GAP_FRAC  = 36 / 83  ≈ 0.434
+# PANEL_SIZE_FRAC = 100 / 83 ≈ 1.205
+PANEL_GAP_FRAC = 0.434
+PANEL_SIZE_FRAC = 1.205
 
 # Default CRP CSV — bundled alongside this file.
 _DEFAULT_CSV = Path(__file__).parent / "data" / "RP06-2120405-OB.csv"
@@ -295,7 +298,7 @@ class PanelScanNode(Node):
         if not self._window:
             try:
                 import os
-                vis = (raw >> 8).astype(np.uint8)
+                vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                 out = os.path.join(os.path.expanduser("~/parsed_flight"), "panel_scan_first_frame.png")
                 cv2.imwrite(out, vis)
                 self.get_logger().info(f"First scan frame saved: {out}")
@@ -316,7 +319,14 @@ class PanelScanNode(Node):
 
         for s in range(NUM_SLICES):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
-            gray = (band >> 8).astype(np.uint8) if raw.dtype != np.uint8 else band.copy()
+            # Normalize to full 8-bit range rather than a raw >> 8 shift.
+            # The >> 8 shift compresses dark slices into a narrow low range,
+            # killing QR code contrast for pyzbar. NORM_MINMAX stretches
+            # whatever signal exists to 0–255.
+            if raw.dtype != np.uint8:
+                gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            else:
+                gray = band.copy()
             try:
                 results = zbar_decode(gray, symbols=[ZBarSymbol.QRCODE])
             except Exception as e:
