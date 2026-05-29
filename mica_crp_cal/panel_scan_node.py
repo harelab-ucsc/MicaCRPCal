@@ -39,6 +39,7 @@ extension, which applies per pixel:
 """
 
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -50,7 +51,8 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
 
-CONFIRM_FRAMES = 3
+WINDOW_SIZE = 10   # sliding window length in frames
+CONFIRM_HITS = 3   # detections required within the window
 NUM_SLICES = 4
 
 # Center wavelengths (nm) for cam0 band slices 0-3.
@@ -128,7 +130,7 @@ class PanelScanNode(Node):
         super().__init__("panel_scan")
         self._bridge = CvBridge()
         self._detector = cv2.QRCodeDetector()
-        self._confirm = 0
+        self._window: deque = deque(maxlen=WINDOW_SIZE)  # sliding detection window
         self._done = False
         self._last_raw: np.ndarray | None = None
         # Per-slice QR corners from the most recent confirmed frame.
@@ -263,18 +265,19 @@ class PanelScanNode(Node):
             else:
                 bboxes.append(None)
 
-        if detected_data is not None:
-            self._confirm += 1
+        hit = detected_data is not None
+        self._window.append(hit)
+        hits = sum(self._window)
+
+        if hit:
             self._last_raw = raw
             self._last_bboxes = bboxes
             self.get_logger().info(
                 f"QR located in slice(s) {detected_slices} "
-                f"({self._confirm}/{CONFIRM_FRAMES})"
+                f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
             )
-            if self._confirm >= CONFIRM_FRAMES:
-                self._publish_calibration()
-        else:
-            self._confirm = 0
+        if hits >= CONFIRM_HITS:
+            self._publish_calibration()
 
     def _watchdog(self) -> None:
         if self._done:
