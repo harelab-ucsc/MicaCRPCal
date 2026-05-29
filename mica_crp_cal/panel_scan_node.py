@@ -242,7 +242,16 @@ class PanelScanNode(Node):
             gray = (band >> 8).astype(np.uint8) if raw.dtype != np.uint8 else band.copy()
             # Use detect() (location only) instead of detectAndDecode() so that
             # QR detection works even when OpenCV is built without QUIRC.
-            found, bbox = self._detector.detect(gray)
+            # Wrap in try/except: detect() can raise cv2.error (convexHull
+            # assertion) on slices with unusual pixel distributions.
+            try:
+                found, bbox = self._detector.detect(gray)
+            except Exception as e:
+                self.get_logger().error(
+                    f"QR detect() failed on slice {s}: {e}"
+                )
+                found = False
+                bbox = None
             if found and bbox is not None:
                 bboxes.append(bbox)
                 detected_slices.append(s)
