@@ -38,6 +38,7 @@ extension, which applies per pixel:
     corrected = (raw_DN / dtype_max) * factor  →  true reflectance ∈ [0, 1]
 """
 
+import multiprocessing as mp
 import time
 from collections import deque
 from pathlib import Path
@@ -136,6 +137,36 @@ def _panel_roi_from_qr(pts: np.ndarray) -> np.ndarray:
     return np.array([panel_tl, panel_tr, panel_br, panel_bl], dtype=np.float32)
 
 
+def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
+    """Runs in a separate process — loads QReader once, processes frames."""
+    from qreader import QReader
+    detector = QReader()
+    while True:
+        item = in_q.get()
+        if item is None:
+            break
+        frame_id, slices = item  # slices: list of (slice_idx, gray uint8)
+        found_corners = None
+        found_slices = []
+        for s, gray in slices:
+            try:
+                texts, dets = detector.detect_and_decode(
+                    image=gray, return_detections=True
+                )
+                if texts and dets:
+                    x1, y1, x2, y2 = dets[0]['bbox_xyxy']
+                    pts = np.array(
+                        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                        dtype=np.float32,
+                    )
+                    if found_corners is None:
+                        found_corners = pts
+                    found_slices.append(s)
+            except Exception:
+                pass
+        out_q.put((frame_id, found_corners, found_slices))
+
+
 def _snap_to_corners(
     band: np.ndarray,
     projected: np.ndarray,
@@ -200,8 +231,19 @@ class PanelScanNode(Node):
     def __init__(self):
         super().__init__("panel_scan")
         self._bridge = CvBridge()
-        self._detector = QReader()
         self._window: deque = deque(maxlen=WINDOW_SIZE)  # sliding detection window
+        self._frame_id: int = 0
+
+        # QReader runs in a separate process so YOLO inference doesn't block
+        # the ROS executor and starve cam1/other subscriptions.
+        self._qr_in: mp.Queue = mp.Queue(maxsize=2)   # drop stale frames
+        self._qr_out: mp.Queue = mp.Queue()
+        self._qr_proc = mp.Process(
+            target=_qreader_worker,
+            args=(self._qr_in, self._qr_out),
+            daemon=True,
+        )
+        self._qr_proc.start()
         self._done = False
         self._last_raw: np.ndarray | None = None
         self._last_bboxes: list[np.ndarray | None] = [None] * NUM_SLICES
@@ -324,55 +366,44 @@ class PanelScanNode(Node):
         slice_w = w // NUM_SLICES
 
         # Run pyzbar on slices 1+2 (695nm, 735nm) — best ink contrast.
-        # Scanning all 4 slices per frame at 3Hz is too slow; 0=450nm and
-        # 3=850nm rarely detect and block the callback. The panel ROI is
-        # projected from the found corners and applied to all 4 slices at
-        # calibration time regardless of which slice detected here.
-        qr_corners: np.ndarray | None = None
-        detected_slices: list[int] = []
-
+        # Submit slices 1+2 to the QReader worker process (non-blocking).
+        slices = []
         for s in (1, 2):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
             gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if raw.dtype != np.uint8 else band.copy()
+            slices.append((s, gray))
+        try:
+            self._qr_in.put_nowait((self._frame_id, slices))
+        except Exception:
+            pass  # queue full — skip this frame, worker is still busy
+        self._frame_id += 1
+
+        # Drain any completed results from the worker.
+        while not self._qr_out.empty():
             try:
-                texts, detections = self._detector.detect_and_decode(
-                    image=gray, return_detections=True
+                _, qr_corners, detected_slices = self._qr_out.get_nowait()
+            except Exception:
+                break
+
+            bboxes: list[np.ndarray | None] = [
+                qr_corners.reshape(1, 4, 2) if qr_corners is not None else None
+                for _ in range(NUM_SLICES)
+            ]
+            hit = qr_corners is not None
+            self._window.append(hit)
+            hits = sum(self._window)
+
+            if hit:
+                self._last_raw = raw
+                self._last_bboxes = bboxes
+                self.get_logger().info(
+                    f"QR located in slice(s) {detected_slices} "
+                    f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
                 )
-            except Exception as e:
-                self.get_logger().error(f"QReader failed on slice {s}: {e}")
-                texts, detections = [], []
-            if texts and detections:
-                det = detections[0]
-                x1, y1, x2, y2 = det['bbox_xyxy']
-                pts = np.array([
-                    [x1, y1], [x2, y1], [x2, y2], [x1, y2]
-                ], dtype=np.float32)
-                if qr_corners is None:
-                    qr_corners = pts
-                detected_slices.append(s)
-                self.get_logger().debug(f"Slice {s}: QR decoded — '{texts[0]}'")
-
-        # Build bboxes for all slices using the shared corners.
-        bboxes: list[np.ndarray | None] = [
-            qr_corners.reshape(1, 4, 2) if qr_corners is not None else None
-            for _ in range(NUM_SLICES)
-        ]
-        detected_data = qr_corners is not None
-
-        hit = bool(detected_data)  # detected_data is now a bool, not None/str
-        self._window.append(hit)
-        hits = sum(self._window)
-
-        if hit:
-            self._last_raw = raw
-            self._last_bboxes = bboxes
-            self.get_logger().info(
-                f"QR located in slice(s) {detected_slices} "
-                f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
-            )
-        if hits >= CONFIRM_HITS:
-            self._publish_calibration()
+            if hits >= CONFIRM_HITS:
+                self._publish_calibration()
+                return
 
     def _watchdog(self) -> None:
         if self._done:
