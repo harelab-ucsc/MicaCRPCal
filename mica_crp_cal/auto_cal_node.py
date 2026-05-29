@@ -400,12 +400,6 @@ class AutoCalNode(Node):
         final_exposure = MAX_EXPOSURE_US
         final_gain = GAIN_STEPS[-1]
 
-        # The "still" role sets ExposureTimeMode=Manual on the raw/mono sensor,
-        # which blocks all subsequent ExposureTime updates. Clear it and wait
-        # a full frame so the camera actually applies it before we proceed.
-        self._set_params(cam, [_param("ExposureTimeMode", 0)])
-        self._next_frame(cam)  # let ExposureTimeMode=0 take effect
-
         for gain in GAIN_STEPS:
             lo, hi = MIN_EXPOSURE_US, MAX_EXPOSURE_US
             exposure = (lo + hi) // 2
@@ -415,14 +409,19 @@ class AutoCalNode(Node):
                 f"gain={gain:.1f}  exposure range [{lo}, {hi}] µs"
             )
 
-            # Set AeEnable and gain, wait a frame, then set ExposureTime.
-            # Each call needs a frame boundary to be applied — the camera ignores
-            # parameters that arrive before the previous batch is committed.
+            # Step 1: disable AE and set gain.
             self._set_params(cam, [
                 _param("AeEnable", False),
                 _param("AnalogueGain", gain),
             ])
-            self._next_frame(cam)  # let AeEnable/gain settle
+            self._next_frame(cam)  # wait for AeEnable to be committed
+
+            # Step 2: AeEnable=False internally sets ExposureTimeMode=Manual,
+            # which then blocks ExposureTime updates. Clear it after it settles.
+            self._set_params(cam, [_param("ExposureTimeMode", 0)])
+            self._next_frame(cam)  # wait for ExposureTimeMode=0 to be committed
+
+            # Step 3: now ExposureTime can be set without conflict.
             self._set_params(cam, [_param("ExposureTime", exposure)])
 
             bright_99 = dark_05 = 0.0
