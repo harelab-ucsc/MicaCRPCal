@@ -343,16 +343,31 @@ class AutoCalNode(Node):
             for p, r in zip(params, result.results)
             if not r.successful
         ]
-        if rejected:
+        if not rejected:
+            return True
+
+        # The libcamera Raspberry Pi IPA returns successful=False for ExposureTime
+        # when ExposureTimeMode is also active, but the value IS applied anyway.
+        # Treat this specific conflict as a known-spurious flag rather than a real
+        # failure — the binary search still converges correctly.
+        SPURIOUS = "ExposureTimeMode and ExposureTime must not be set simultaneously"
+        spurious = [(n, r) for n, r in rejected if SPURIOUS in r]
+        real = [(n, r) for n, r in rejected if SPURIOUS not in r]
+
+        if spurious:
+            self.get_logger().debug(
+                f"{cam}: ExposureTime returned successful=False due to "
+                f"ExposureTimeMode conflict, but value is applied — ignoring."
+            )
+        if real:
             sep = "=" * 62
-            details = "".join(f"    {name}: {reason}\n" for name, reason in rejected)
+            details = "".join(f"    {name}: {reason}\n" for name, reason in real)
             self.get_logger().error(
                 f"\n{sep}\n"
                 f"  CAMERA PARAMETER UPDATE REJECTED — {cam}\n"
                 f"  The camera driver refused the following settings:\n"
                 f"{details}"
-                f"  Binary search frame may have been captured at the WRONG\n"
-                f"  exposure. Increase SETTLE_FRAMES if this recurs.\n"
+                f"  The parameter was NOT applied.\n"
                 f"{sep}"
             )
             return False
