@@ -47,7 +47,6 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from qreader import QReader
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node

@@ -1,5 +1,5 @@
 """
-AutoCalNode — automatic exposure and irradiance calibration at 6 m AGL.
+AutoCalNode — automatic exposure and irradiance calibration at 3 m AGL.
 
 Waits until the drone clears ALT_THRESHOLD_M (radalt), then:
 
@@ -62,7 +62,7 @@ except ImportError:
 # Tunable limits
 # ---------------------------------------------------------------------------
 
-ALT_THRESHOLD_M = 6.0
+ALT_THRESHOLD_M = 3.0
 
 # Exposure: 5 ms gives < 1 px motion smear at 5 m/s with 0.03 m/px GSD.
 MAX_EXPOSURE_US = 5_000
