@@ -51,7 +51,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
 
-WINDOW_SIZE = 10   # sliding window length in frames
+WINDOW_SIZE = 30   # sliding window length in frames (~10 s at 3 Hz)
 CONFIRM_HITS = 3   # detections required within the window
 NUM_SLICES = 4
 
