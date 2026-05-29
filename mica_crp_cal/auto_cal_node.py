@@ -102,16 +102,17 @@ NUM_CAM0_SLICES = 4
 # ---------------------------------------------------------------------------
 
 def _analyze_cam0(img: np.ndarray) -> tuple[float, float]:
-    """Return (bright_99, dark_05) across all four band slices."""
+    """Return (bright_99, dark_05) for the 735 nm band (slice 2).
+
+    Calibrating against the full-band max/min fails indoors because 450 nm
+    and 850 nm bands have near-zero signal while 695 nm saturates, making the
+    constraints contradictory. The 735 nm band (slice 2) is the 2nd-least-dark
+    band and gives a representative exposure target for flight.
+    """
     w = img.shape[1]
     sw = w // NUM_CAM0_SLICES
-    arr = img.astype(np.float64)
-    p99s, p05s = [], []
-    for i in range(NUM_CAM0_SLICES):
-        sl = arr[:, i * sw: (i + 1) * sw]
-        p99s.append(float(np.percentile(sl, 99)))
-        p05s.append(float(np.percentile(sl, 5)))
-    return max(p99s), min(p05s)
+    sl = img[:, 2 * sw: 3 * sw].astype(np.float64)
+    return float(np.percentile(sl, 99)), float(np.percentile(sl, 5))
 
 
 def _analyze_cam1(img: np.ndarray) -> tuple[float, float]:
