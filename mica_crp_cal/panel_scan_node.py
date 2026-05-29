@@ -308,47 +308,41 @@ class PanelScanNode(Node):
         h, w = raw.shape[:2]
         slice_w = w // NUM_SLICES
 
-        # Try QR detection on all slices. Printed QR codes have best contrast
-        # in visible bands; NIR (slice 3, ~850 nm) often has poor ink contrast
-        # and may not decode. Each slice gets its own corners where possible so
-        # any per-camera geometric offset is handled naturally. A frame counts
-        # as a confirmation if at least one slice detects the QR.
-        bboxes: list[np.ndarray | None] = []
+        # Only run pyzbar on visible bands (695 nm = slice 1, 735 nm = slice 2).
+        # 450 nm (slice 0) has no indoor signal; 850 nm (slice 3) has poor ink
+        # contrast in NIR. Once corners are found in any detecting slice, the
+        # same corners are reused for all slices — each slice still measures its
+        # own DN in the shared panel ROI independently.
+        DETECT_SLICES = (1, 2)
+        qr_corners: np.ndarray | None = None
         detected_slices: list[int] = []
-        detected_data: str | None = None
 
-        for s in range(NUM_SLICES):
+        for s in DETECT_SLICES:
             band = raw[:, s * slice_w: (s + 1) * slice_w]
-            # Normalize to full 8-bit range rather than a raw >> 8 shift.
-            # The >> 8 shift compresses dark slices into a narrow low range,
-            # killing QR code contrast for pyzbar. NORM_MINMAX stretches
-            # whatever signal exists to 0–255.
-            if raw.dtype != np.uint8:
-                gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            else:
-                gray = band.copy()
+            gray = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
+                if raw.dtype != np.uint8 else band.copy()
             try:
                 results = zbar_decode(gray, symbols=[ZBarSymbol.QRCODE])
             except Exception as e:
                 self.get_logger().error(f"pyzbar decode failed on slice {s}: {e}")
                 results = []
             if results:
-                # pyzbar polygon gives exact corner points in order.
                 poly = results[0].polygon
                 pts = np.array([[p.x, p.y] for p in poly], dtype=np.float32)
-                # Ensure 4 corners — pyzbar can return 3 on partial detections.
                 if len(pts) == 4:
-                    bbox = pts.reshape(1, 4, 2)
-                    bboxes.append(bbox)
+                    if qr_corners is None:
+                        qr_corners = pts  # first detection sets the corners
                     detected_slices.append(s)
-                    detected_data = True
                     self.get_logger().debug(
                         f"Slice {s}: QR decoded — '{results[0].data.decode()}'"
                     )
-                else:
-                    bboxes.append(None)
-            else:
-                bboxes.append(None)
+
+        # Build bboxes for all slices using the shared corners.
+        bboxes: list[np.ndarray | None] = [
+            qr_corners.reshape(1, 4, 2) if qr_corners is not None else None
+            for _ in range(NUM_SLICES)
+        ]
+        detected_data = qr_corners is not None
 
         hit = detected_data is not None
         self._window.append(hit)
@@ -404,31 +398,29 @@ class PanelScanNode(Node):
         else:
             dtype_max = 1.0
 
-        # Build the fallback corners from the first slice that detected the QR.
-        # Used for any slice whose own detection failed.
-        fallback_pts = next(
+        # Only calibrate slices that can see QR ink (DETECT_SLICES = 1, 2).
+        # Dark/NIR bands (0=450nm, 3=850nm) get factor=1.0 — no projection.
+        qr_pts = next(
             b.reshape(4, 2).astype(np.float32) for b in bboxes if b is not None
         )
-        fallback_idx = next(i for i, b in enumerate(bboxes) if b is not None)
 
         factors = []
         for i in range(NUM_SLICES):
+            if i not in DETECT_SLICES:
+                self.get_logger().info(
+                    f"Slice {i} ({CAM0_BAND_NM[i]} nm): skipped (dark band) — factor=1.0"
+                )
+                factors.append(1.0)
+                continue
+
             band = raw[:, i * slice_w: (i + 1) * slice_w]
 
-            if bboxes[i] is not None:
-                pts = bboxes[i].reshape(4, 2).astype(np.float32)
-                corners_note = ""
-            else:
-                pts = fallback_pts
-                corners_note = (
-                    f" (QR not detected in this slice — "
-                    f"using corners from slice {fallback_idx})"
-                )
-
-            projected_panel = _panel_roi_from_qr(pts)
-            band_u8 = (band >> 8).astype(np.uint8) if band.dtype != np.uint8 else band
+            projected_panel = _panel_roi_from_qr(qr_pts)
+            band_u8 = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
+                if band.dtype != np.uint8 else band
             panel_pts = _snap_to_corners(band_u8, projected_panel)
             panel_pts_int = np.round(panel_pts).astype(np.int32)
+            corners_note = ""
 
             mask = np.zeros(band.shape[:2], dtype=np.uint8)
             cv2.fillConvexPoly(mask, panel_pts_int, 255)
@@ -436,8 +428,8 @@ class PanelScanNode(Node):
             pixels = band[mask > 0]
             if pixels.size == 0:
                 self.get_logger().error(
-                    f"Slice {i} ({CAM0_BAND_NM[i]} nm): panel mask is empty"
-                    f"{corners_note}. Check panel position. "
+                    f"Slice {i} ({CAM0_BAND_NM[i]} nm): panel mask is empty. "
+                    "Check panel position. "
                     "Falling back to factor=1.0."
                 )
                 factors.append(1.0)
@@ -460,7 +452,7 @@ class PanelScanNode(Node):
             factor = self._albedo[i] / (mean_dn / dtype_max)
             factors.append(factor)
             self.get_logger().info(
-                f"Slice {i} ({CAM0_BAND_NM[i]} nm){corners_note}: "
+                f"Slice {i} ({CAM0_BAND_NM[i]} nm): "
                 f"mean_DN={mean_dn:.1f}  albedo={self._albedo[i]:.4f}  "
                 f"factor={factor:.4f}"
             )
@@ -488,36 +480,28 @@ class PanelScanNode(Node):
             import os
 
             # Normalise 16-bit → 8-bit and convert to BGR for drawing.
-            vis = (raw >> 8).astype(np.uint8)
+            vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             vis_bgr = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-
-            fallback_pts = next(b.reshape(4, 2).astype(np.float32) for b in bboxes if b is not None)
 
             for i in range(NUM_SLICES):
                 x_off = i * slice_w
+                label = f"{CAM0_BAND_NM[i]}nm  f={factors[i]:.3f}"
+                cv2.putText(vis_bgr, label, (x_off + 10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
-                pts = bboxes[i].reshape(4, 2).astype(np.float32) if bboxes[i] is not None else fallback_pts
+                if i not in DETECT_SLICES:
+                    continue  # no boxes for dark bands
+
+                pts = qr_pts
                 panel_pts = _panel_roi_from_qr(pts)
 
-                # Offset slice-local coords to full-image coords.
-                qr_global = pts.copy()
-                qr_global[:, 0] += x_off
-                panel_global = panel_pts.copy()
-                panel_global[:, 0] += x_off
+                qr_global = pts.copy();  qr_global[:, 0] += x_off
+                panel_global = panel_pts.copy();  panel_global[:, 0] += x_off
 
-                qr_int = np.round(qr_global).astype(np.int32)
-                panel_int = np.round(panel_global).astype(np.int32)
-
-                # QR box: green. Panel ROI: blue.
-                cv2.polylines(vis_bgr, [qr_int], isClosed=True, color=(0, 255, 0), thickness=4)
-                cv2.polylines(vis_bgr, [panel_int], isClosed=True, color=(255, 80, 0), thickness=4)
-
-                label = f"{CAM0_BAND_NM[i]}nm  f={factors[i]:.3f}"
-                cv2.putText(
-                    vis_bgr, label,
-                    (x_off + 10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2,
-                )
+                cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
+                              isClosed=True, color=(0, 255, 0), thickness=4)
+                cv2.polylines(vis_bgr, [np.round(panel_global).astype(np.int32)],
+                              isClosed=True, color=(255, 80, 0), thickness=4)
 
             out_dir = os.path.expanduser("~/parsed_flight")
             os.makedirs(out_dir, exist_ok=True)
