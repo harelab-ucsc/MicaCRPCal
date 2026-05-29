@@ -234,7 +234,8 @@ class PanelScanNode(Node):
         self._window: deque = deque(maxlen=WINDOW_SIZE)
         self._frame_id: int = 0
         self._first_frame_saved: bool = False
-        self._last_qr_pts = None  # corners from last confirmed detection
+        self._last_qr_pts = None          # corners from last confirmed detection
+        self._last_detected_slices: list = []
 
         # QReader process — created lazily in _exposure_locked_cb so YOLO
         # doesn't consume CPU during auto_cal's binary search.
@@ -410,6 +411,7 @@ class PanelScanNode(Node):
                 self._last_raw = raw
                 self._last_bboxes = bboxes
                 self._last_qr_pts = qr_corners
+                self._last_detected_slices = detected_slices
                 self.get_logger().info(
                     f"QR located in slice(s) {detected_slices} "
                     f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
@@ -566,19 +568,22 @@ class PanelScanNode(Node):
 
             qr_pts = self._last_qr_pts
             panel_proj = _panel_roi_from_qr(qr_pts)
+            detected = self._last_detected_slices
             for i in range(NUM_SLICES):
                 x_off = i * slice_w
                 label = f"{CAM0_BAND_NM[i]}nm  f={factors[i]:.3f}"
                 cv2.putText(vis_bgr, label, (x_off + 10, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
-                qr_global = qr_pts.copy();  qr_global[:, 0] += x_off
                 panel_global = panel_proj.copy();  panel_global[:, 0] += x_off
-
-                cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
-                              isClosed=True, color=(0, 255, 0), thickness=4)
                 cv2.polylines(vis_bgr, [np.round(panel_global).astype(np.int32)],
                               isClosed=True, color=(255, 80, 0), thickness=4)
+
+                # QR box only where it was actually detected.
+                if i in detected:
+                    qr_global = qr_pts.copy();  qr_global[:, 0] += x_off
+                    cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
+                                  isClosed=True, color=(0, 255, 0), thickness=4)
 
             out_dir = os.path.expanduser("~/parsed_flight")
             os.makedirs(out_dir, exist_ok=True)
