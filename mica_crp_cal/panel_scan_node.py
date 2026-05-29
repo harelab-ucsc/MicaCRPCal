@@ -46,6 +46,8 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
+from pyzbar.pyzbar import ZBarSymbol
+from pyzbar.pyzbar import decode as zbar_decode
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
@@ -124,12 +126,70 @@ def _panel_roi_from_qr(pts: np.ndarray) -> np.ndarray:
     return np.array([panel_tl, panel_tr, panel_br, panel_bl], dtype=np.float32)
 
 
+def _snap_to_corners(
+    band: np.ndarray,
+    projected: np.ndarray,
+    search_radius: int = 40,
+    max_corners: int = 20,
+    quality: float = 0.05,
+    min_dist: float = 10.0,
+) -> np.ndarray:
+    """Snap each projected panel corner to the nearest strong image corner.
+
+    For each of the 4 projected panel ROI corners, searches a small
+    neighbourhood in the band image for strong corners using
+    goodFeaturesToTrack. If a detected corner falls within `search_radius`
+    pixels it replaces the projected point; otherwise the projected point
+    is kept as fallback.
+
+    Args:
+        band:          (H, W) uint8 grayscale slice image.
+        projected:     (4, 2) float32 projected panel corners.
+        search_radius: pixel radius around each projected corner to search.
+
+    Returns:
+        (4, 2) float32 snapped panel corners.
+    """
+    h, w = band.shape[:2]
+    snapped = projected.copy()
+
+    for i, proj in enumerate(projected):
+        px, py = int(proj[0]), int(proj[1])
+
+        # Clamp search window to image bounds.
+        x0 = max(0, px - search_radius)
+        y0 = max(0, py - search_radius)
+        x1 = min(w, px + search_radius)
+        y1 = min(h, py + search_radius)
+
+        patch = band[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+
+        corners = cv2.goodFeaturesToTrack(
+            patch, maxCorners=max_corners, qualityLevel=quality,
+            minDistance=min_dist,
+        )
+        if corners is None:
+            continue
+
+        # Convert patch-local coords back to full-image coords.
+        corners_global = corners.reshape(-1, 2) + np.array([x0, y0], dtype=np.float32)
+
+        # Find the nearest detected corner to the projected point.
+        dists = np.linalg.norm(corners_global - proj, axis=1)
+        nearest_idx = int(np.argmin(dists))
+        if dists[nearest_idx] < search_radius:
+            snapped[i] = corners_global[nearest_idx]
+
+    return snapped
+
+
 class PanelScanNode(Node):
 
     def __init__(self):
         super().__init__("panel_scan")
         self._bridge = CvBridge()
-        self._detector = cv2.QRCodeDetector()
         self._window: deque = deque(maxlen=WINDOW_SIZE)  # sliding detection window
         self._done = False
         self._last_raw: np.ndarray | None = None
@@ -246,22 +306,26 @@ class PanelScanNode(Node):
         for s in range(NUM_SLICES):
             band = raw[:, s * slice_w: (s + 1) * slice_w]
             gray = (band >> 8).astype(np.uint8) if raw.dtype != np.uint8 else band.copy()
-            # Use detect() (location only) instead of detectAndDecode() so that
-            # QR detection works even when OpenCV is built without QUIRC.
-            # Wrap in try/except: detect() can raise cv2.error (convexHull
-            # assertion) on slices with unusual pixel distributions.
             try:
-                found, bbox = self._detector.detect(gray)
+                results = zbar_decode(gray, symbols=[ZBarSymbol.QRCODE])
             except Exception as e:
-                self.get_logger().error(
-                    f"QR detect() failed on slice {s}: {e}"
-                )
-                found = False
-                bbox = None
-            if found and bbox is not None:
-                bboxes.append(bbox)
-                detected_slices.append(s)
-                detected_data = True
+                self.get_logger().error(f"pyzbar decode failed on slice {s}: {e}")
+                results = []
+            if results:
+                # pyzbar polygon gives exact corner points in order.
+                poly = results[0].polygon
+                pts = np.array([[p.x, p.y] for p in poly], dtype=np.float32)
+                # Ensure 4 corners — pyzbar can return 3 on partial detections.
+                if len(pts) == 4:
+                    bbox = pts.reshape(1, 4, 2)
+                    bboxes.append(bbox)
+                    detected_slices.append(s)
+                    detected_data = True
+                    self.get_logger().debug(
+                        f"Slice {s}: QR decoded — '{results[0].data.decode()}'"
+                    )
+                else:
+                    bboxes.append(None)
             else:
                 bboxes.append(None)
 
@@ -340,7 +404,10 @@ class PanelScanNode(Node):
                     f"using corners from slice {fallback_idx})"
                 )
 
-            panel_pts_int = np.round(_panel_roi_from_qr(pts)).astype(np.int32)
+            projected_panel = _panel_roi_from_qr(pts)
+            band_u8 = (band >> 8).astype(np.uint8) if band.dtype != np.uint8 else band
+            panel_pts = _snap_to_corners(band_u8, projected_panel)
+            panel_pts_int = np.round(panel_pts).astype(np.int32)
 
             mask = np.zeros(band.shape[:2], dtype=np.uint8)
             cv2.fillConvexPoly(mask, panel_pts_int, 255)
