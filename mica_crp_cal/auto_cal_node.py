@@ -174,6 +174,20 @@ class AutoCalNode(Node):
         # Altitude gate — set immediately if force_cal is True.
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
+
+        # Indoor mode: raises the exposure ceiling beyond the flight-safe 5 ms
+        # limit so the binary search can find a usable exposure in low light.
+        # DO NOT use for actual flight — motion blur will degrade images.
+        self.declare_parameter("max_exposure_us", MAX_EXPOSURE_US)
+        self._max_exposure_us: int = int(
+            self.get_parameter("max_exposure_us").value
+        )
+        if self._max_exposure_us != MAX_EXPOSURE_US:
+            self.get_logger().warn(
+                f"max_exposure_us overridden to {self._max_exposure_us} µs "
+                f"(flight limit is {MAX_EXPOSURE_US} µs). "
+                "INDOOR TESTING ONLY — do not fly with this setting."
+            )
         self._above_alt = threading.Event()
         self._alt_notified = False  # log the crossing only once
         if self._force_cal:
@@ -266,12 +280,12 @@ class AutoCalNode(Node):
         if self._force_cal:
             self.get_logger().info(
                 f"AutoCalNode ready — force_cal active, starting immediately. "
-                f"Exposure limit: {MAX_EXPOSURE_US} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
+                f"Exposure limit: {self._max_exposure_us} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
             )
         else:
             self.get_logger().info(
                 f"AutoCalNode ready — waiting for {ALT_THRESHOLD_M} m AGL. "
-                f"Exposure limit: {MAX_EXPOSURE_US} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
+                f"Exposure limit: {self._max_exposure_us} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
             )
 
     # -----------------------------------------------------------------------
@@ -412,11 +426,11 @@ class AutoCalNode(Node):
         bright_thresh = BRIGHT_CEIL * dtype_max
         dark_thresh = DARK_FLOOR * dtype_max
 
-        final_exposure = MAX_EXPOSURE_US
+        final_exposure = self._max_exposure_us
         final_gain = GAIN_STEPS[-1]
 
         for gain in GAIN_STEPS:
-            lo, hi = MIN_EXPOSURE_US, MAX_EXPOSURE_US
+            lo, hi = MIN_EXPOSURE_US, self._max_exposure_us
             exposure = (lo + hi) // 2
 
             self.get_logger().info(
@@ -468,7 +482,7 @@ class AutoCalNode(Node):
                 if bright_99 > bright_thresh:
                     # Clipping — reduce exposure.
                     hi = exposure
-                elif dark_05 < dark_thresh and exposure >= MAX_EXPOSURE_US:
+                elif dark_05 < dark_thresh and exposure >= self._max_exposure_us:
                     # Too dark even at max exposure for this gain — try next gain.
                     break
                 elif dark_05 < dark_thresh:
