@@ -400,6 +400,12 @@ class AutoCalNode(Node):
         final_exposure = MAX_EXPOSURE_US
         final_gain = GAIN_STEPS[-1]
 
+        # The "still" role sets ExposureTimeMode=Manual on the raw/mono sensor,
+        # which blocks all subsequent ExposureTime updates. Clear it once before
+        # the binary search starts. ExposureTimeMode=0 means off/auto, leaving
+        # AeEnable as the sole mode control.
+        self._set_params(cam, [_param("ExposureTimeMode", 0)])
+
         for gain in GAIN_STEPS:
             lo, hi = MIN_EXPOSURE_US, MAX_EXPOSURE_US
             exposure = (lo + hi) // 2
