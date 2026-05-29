@@ -341,7 +341,7 @@ class PanelScanNode(Node):
         ]
         detected_data = qr_corners is not None
 
-        hit = detected_data is not None
+        hit = bool(detected_data)  # detected_data is now a bool, not None/str
         self._window.append(hit)
         hits = sum(self._window)
 
