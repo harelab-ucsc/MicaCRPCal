@@ -236,9 +236,12 @@ class PanelScanNode(Node):
 
         # QReader runs in a separate process so YOLO inference doesn't block
         # the ROS executor and starve cam1/other subscriptions.
-        self._qr_in: mp.Queue = mp.Queue(maxsize=2)   # drop stale frames
-        self._qr_out: mp.Queue = mp.Queue()
-        self._qr_proc = mp.Process(
+        # MUST use 'spawn' not 'fork': fork copies FastDDS internal threads into
+        # the child which corrupts DDS state in the parent, killing cam1.
+        _ctx = mp.get_context('spawn')
+        self._qr_in: mp.Queue = _ctx.Queue(maxsize=2)   # drop stale frames
+        self._qr_out: mp.Queue = _ctx.Queue()
+        self._qr_proc = _ctx.Process(
             target=_qreader_worker,
             args=(self._qr_in, self._qr_out),
             daemon=True,
