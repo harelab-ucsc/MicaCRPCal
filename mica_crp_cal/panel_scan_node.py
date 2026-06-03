@@ -429,6 +429,11 @@ class PanelScanNode(Node):
         # Save the very first frame after exposure lock so the user can verify quality.
         if not self._first_frame_saved:
             self._first_frame_saved = True
+            self.get_logger().info(
+                f"First scan frame: {raw.shape[1]}x{raw.shape[0]} px, "
+                f"dtype={raw.dtype} — "
+                f"slice width={raw.shape[1] // NUM_SLICES} px per band"
+            )
             try:
                 import os
                 vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
