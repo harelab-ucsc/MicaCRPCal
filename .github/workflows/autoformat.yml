@@ -1,0 +1,42 @@
+name: Auto-format
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  autoformat:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install autopep8
+        run: pip install "autopep8" "pycodestyle>=2.7.0,<2.9.0"
+
+      - name: Run autopep8
+        run: |
+          autopep8 --in-place --aggressive \
+            --max-line-length 99 \
+            --recursive mica_crp_cal test
+
+      - name: Commit formatting fixes
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git add -u
+            git commit -m "style: apply autopep8 auto-formatting"
+            git push
+          else
+            echo "No formatting changes."
+          fi

@@ -367,7 +367,9 @@ class PanelScanNode(Node):
             try:
                 import os
                 vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                out = os.path.join(os.path.expanduser("~/parsed_flight"), "panel_scan_first_frame.png")
+                out = os.path.join(
+                    os.path.expanduser("~/parsed_flight"),
+                    "panel_scan_first_frame.png")
                 cv2.imwrite(out, vis)
                 self.get_logger().info(f"First scan frame saved: {out}")
             except Exception as e:
@@ -575,13 +577,15 @@ class PanelScanNode(Node):
                 cv2.putText(vis_bgr, label, (x_off + 10, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
-                panel_global = panel_proj.copy();  panel_global[:, 0] += x_off
+                panel_global = panel_proj.copy()
+                panel_global[:, 0] += x_off
                 cv2.polylines(vis_bgr, [np.round(panel_global).astype(np.int32)],
                               isClosed=True, color=(255, 80, 0), thickness=4)
 
                 # QR box only where it was actually detected.
                 if i in detected:
-                    qr_global = qr_pts.copy();  qr_global[:, 0] += x_off
+                    qr_global = qr_pts.copy()
+                    qr_global[:, 0] += x_off
                     cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
                                   isClosed=True, color=(0, 255, 0), thickness=4)
 

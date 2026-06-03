@@ -38,10 +38,10 @@ def _write_csv(path, rows):
 def _qr_corners_axis_aligned(x0=10, y0=10, size=80):
     """Return (4,2) corners for an axis-aligned QR with panel below it."""
     return np.array([
-        [x0,        y0],
+        [x0, y0],
         [x0 + size, y0],
         [x0 + size, y0 + size],
-        [x0,        y0 + size],
+        [x0, y0 + size],
     ], dtype=np.float32)
 
 
@@ -237,10 +237,10 @@ class TestFactorComputation:
         """
         x0 = 10  # same local position in every slice
         pts = np.array([
-            [x0,      10],
+            [x0, 10],
             [x0 + 60, 10],
             [x0 + 60, 70],
-            [x0,      70],
+            [x0, 70],
         ], dtype=np.float32)
         return pts
 

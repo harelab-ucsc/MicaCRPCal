@@ -61,7 +61,7 @@ ALT_THRESHOLD_M = 3.0
 
 # Brightness targets (as fraction of dtype_max).
 BRIGHT_CEIL = 0.85   # 99th-pct of representative band must stay below this
-DARK_FLOOR  = 0.05   # 5th-pct of representative band must stay above this
+DARK_FLOOR = 0.05   # 5th-pct of representative band must stay above this
 
 # Require this many consecutive in-bounds frames before declaring convergence.
 CONVERGE_FRAMES = 5
@@ -121,7 +121,7 @@ def _analyze_cam1(img: np.ndarray) -> tuple[float, float]:
         arr[1::2, 1::2].ravel(),                                   # R
     ]
     p99s = [float(np.percentile(ch, 99)) for ch in channels]
-    p05s = [float(np.percentile(ch, 5))  for ch in channels]
+    p05s = [float(np.percentile(ch, 5)) for ch in channels]
     return max(p99s), min(p05s)
 
 
