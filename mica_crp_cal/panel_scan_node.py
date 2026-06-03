@@ -39,7 +39,6 @@ extension, which applies per pixel:
 """
 
 import multiprocessing as mp
-import time
 from collections import deque
 from pathlib import Path
 
@@ -47,8 +46,6 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
@@ -58,12 +55,6 @@ WINDOW_SIZE = 30    # sliding window length in frames (~10 s at 3 Hz)
 CONFIRM_HITS = 3    # detections required within the window
 CONFIRM_FRAMES = CONFIRM_HITS   # alias used by tests and docstring
 NUM_SLICES = 4
-
-# If no QR detected after this many seconds, start cycling through exposures.
-FALLBACK_TIMEOUT_S = 30.0
-FALLBACK_STEP_S = 5.0       # seconds between each exposure change
-# Exposures to try (µs) — low first to fight saturation, then up.
-FALLBACK_EXPOSURES = [500, 1000, 2000, 4000, 8000, 16000, 33000]
 
 # Center wavelengths (nm) for cam0 band slices 0-3.
 CAM0_BAND_NM = (450, 695, 735, 850)
@@ -331,15 +322,6 @@ class PanelScanNode(Node):
         self._last_raw: np.ndarray | None = None
         self._last_bboxes: list[np.ndarray | None] = [None] * NUM_SLICES
 
-        # Fallback: if no QR detected after FALLBACK_TIMEOUT_S, start cycling
-        # through FALLBACK_EXPOSURES on cam0 every FALLBACK_STEP_S seconds.
-        self._scan_open_t: float | None = None   # set when exposure locked
-        self._fallback_idx: int = 0
-        self._fallback_last_t: float = 0.0
-        self._cam0_param_client = self.create_client(
-            SetParameters, "/cam0/camera_node/set_parameters"
-        )
-
         # Exposure-lock gate: QR scanning only starts once auto_cal has locked
         # the cameras. mean_panel_DN encodes ExposureTime — scanning before lock
         # would produce factors calibrated at a different exposure than flight.
@@ -414,7 +396,6 @@ class PanelScanNode(Node):
         if self._exposure_locked:
             return
         self._exposure_locked = True
-        self._scan_open_t = time.monotonic()
 
         # Start the QReader worker now — no point loading YOLO during auto_cal.
         self._qr_in = self._qr_ctx.Queue(maxsize=2)
@@ -520,37 +501,6 @@ class PanelScanNode(Node):
             "Ensure the CRP panel is flat below the drone, QR tag visible, "
             "in direct sunlight with no shadow."
         )
-
-        # After FALLBACK_TIMEOUT_S with no detections, cycle through exposures.
-        if self._scan_open_t is None:
-            return
-        elapsed = time.monotonic() - self._scan_open_t
-        if elapsed < FALLBACK_TIMEOUT_S or sum(self._window) > 0:
-            return
-        now = time.monotonic()
-        if now - self._fallback_last_t < FALLBACK_STEP_S:
-            return
-
-        exp = FALLBACK_EXPOSURES[self._fallback_idx % len(FALLBACK_EXPOSURES)]
-        self._fallback_idx += 1
-        self.get_logger().warn(
-            f"panel_scan: no QR detected after {elapsed:.0f} s — "
-            f"trying cam0 ExposureTime={exp} µs "
-            f"(step {self._fallback_idx}/{len(FALLBACK_EXPOSURES)})"
-        )
-        self._fallback_last_t = now
-
-        if not self._cam0_param_client.service_is_ready():
-            return
-        req = SetParameters.Request()
-        req.parameters = [Parameter(
-            name="ExposureTime",
-            value=ParameterValue(
-                type=ParameterType.PARAMETER_INTEGER,
-                integer_value=exp,
-            ),
-        )]
-        self._cam0_param_client.call_async(req)
 
     # ------------------------------------------------------------------
     # Calibration factor computation
