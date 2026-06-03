@@ -1,31 +1,26 @@
 """
-AutoCalNode — automatic exposure and irradiance calibration at 3 m AGL.
+AutoCalNode — automatic exposure lock and irradiance calibration at 3 m AGL.
 
 Waits until the drone clears ALT_THRESHOLD_M (radalt), then:
 
-  1. Binary-searches ExposureTime and AnalogueGain for cam0 and cam1 so that:
-       - 99th-percentile DN of the BRIGHTEST band stays below BRIGHT_CEIL.
-       - 5th-percentile DN of the DARKEST band stays above DARK_FLOOR.
-     Gain is increased only when the maximum allowed exposure is insufficient
-     to lift the darkest band above the floor. This keeps noise as low as
-     possible while avoiding motion blur.
+  1. Waits for libcamera's built-in AE/AGC to converge: CONVERGE_FRAMES
+     consecutive frames where the 99th-pct DN of the representative band
+     stays below BRIGHT_CEIL and the 5th-pct stays above DARK_FLOOR.
 
-  2. Locks both cameras at the found settings (AeEnable=False).
+  2. Reads back the settled ExposureTime and AnalogueGain from the camera
+     node's ae_exposure_time_us / ae_analogue_gain parameters, which the
+     camera_ros driver populates each frame from libcamera request metadata.
 
-  3. Snapshots the AS7265x irradiance and publishes it on /panel_cal/spec_ref
-     (latched) so stream_processor can apply the per-cycle irradiance ratio
-     correction throughout the flight.
+  3. Locks both cameras at those settings (AeEnable=False + explicit values).
 
-  4. Exits.
+  4. Snapshots the AS7265x irradiance and publishes it on /panel_cal/spec_ref
+     (latched) so stream_processor can apply per-cycle irradiance correction.
 
-Conservative limits (tune in constants below):
-  MAX_EXPOSURE_US = 5 000 µs (5 ms)  — < 1 px smear at 5 m/s, 0.03 m/px GSD
-  MAX_GAIN        = 6.0              — beyond this, analogue noise degrades
-                                       reflectance accuracy on small sensors
+  5. Exits.
 
-cam0 (multispectral, 4 bands side-by-side on one sensor) and cam1 (Bayer RGB,
-off-nadir) have independent exposures because they are separate cameras with
-different lenses. cam0 analysis uses per-slice min/max; cam1 uses the full frame.
+cam0 (multispectral, 4 bands side-by-side) and cam1 (Bayer RGB, off-nadir)
+are calibrated sequentially — their lenses differ so they need independent
+exposures.
 """
 
 import threading
@@ -36,7 +31,7 @@ import rclpy
 import rclpy.executors
 from cv_bridge import CvBridge
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -59,29 +54,22 @@ except ImportError:
     AS7265xCal = None
 
 # ---------------------------------------------------------------------------
-# Tunable limits
+# Tunable constants
 # ---------------------------------------------------------------------------
 
 ALT_THRESHOLD_M = 3.0
 
-# Exposure: 5 ms gives < 1 px motion smear at 5 m/s with 0.03 m/px GSD.
-MAX_EXPOSURE_US = 5_000
-MIN_EXPOSURE_US = 1000  # cam1 rejects values below ~1000 µs (integer range)
-
-# Gain: try these levels in order, stepping up only when MAX_EXPOSURE is not
-# enough to satisfy DARK_FLOOR. Higher gain → more analogue noise.
-GAIN_STEPS = (1.0, 2.0, 4.0, 6.0)
-
 # Brightness targets (as fraction of dtype_max).
-BRIGHT_CEIL = 0.85   # 99th-pct of brightest band must stay below this
-DARK_FLOOR = 0.05    # 5th-pct of darkest band must stay above this
+BRIGHT_CEIL = 0.85   # 99th-pct of representative band must stay below this
+DARK_FLOOR  = 0.05   # 5th-pct of representative band must stay above this
 
-# Binary-search budget per gain level.
-MAX_ITERS = 8
+# Require this many consecutive in-bounds frames before declaring convergence.
+CONVERGE_FRAMES = 5
 
-# How many frames to skip after a parameter change before sampling.
-# At 3 Hz one frame = 333 ms; skipping 1 gives ~333 ms settling time.
-SETTLE_FRAMES = 3
+# Lock at current AE state if convergence hasn't been reached within this time.
+CONVERGE_TIMEOUT_S = 20.0
+
+NUM_CAM0_SLICES = 4
 
 _LATCHED_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -93,8 +81,6 @@ _SNS_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
 )
-
-NUM_CAM0_SLICES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -172,25 +158,11 @@ class AutoCalNode(Node):
         super().__init__("auto_cal")
         self._bridge = CvBridge()
 
-        # Altitude gate — set immediately if force_cal is True.
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
 
-        # Indoor mode: raises the exposure ceiling beyond the flight-safe 5 ms
-        # limit so the binary search can find a usable exposure in low light.
-        # DO NOT use for actual flight — motion blur will degrade images.
-        self.declare_parameter("max_exposure_us", MAX_EXPOSURE_US)
-        self._max_exposure_us: int = int(
-            self.get_parameter("max_exposure_us").value
-        )
-        if self._max_exposure_us != MAX_EXPOSURE_US:
-            self.get_logger().warn(
-                f"max_exposure_us overridden to {self._max_exposure_us} µs "
-                f"(flight limit is {MAX_EXPOSURE_US} µs). "
-                "INDOOR TESTING ONLY — do not fly with this setting."
-            )
         self._above_alt = threading.Event()
-        self._alt_notified = False  # log the crossing only once
+        self._alt_notified = False
         if self._force_cal:
             self._above_alt.set()
             self.get_logger().warn(
@@ -212,27 +184,33 @@ class AutoCalNode(Node):
         self._spec_lock = threading.Lock()
         self._latest_spec: list | None = None
 
-        # /panel_cal/spec_ref publisher
         self._pub_spec_ref = self.create_publisher(
             Float32MultiArray, "/panel_cal/spec_ref", _LATCHED_QOS
         )
         # /cal/exposure_locked — latched Bool published once cameras are locked.
-        # panel_scan subscribes to this and only starts its QR-scan window after
-        # receiving it, ensuring the panel is imaged at the same exposure the
-        # flight images will use.
+        # panel_scan subscribes and only opens its QR-scan window after receiving
+        # it, ensuring the panel is imaged at the same exposure as the flight.
         self._pub_exposure_locked = self.create_publisher(
             Bool, "/cal/exposure_locked", _LATCHED_QOS
         )
 
-        # SetParameters service clients for each camera.
-        # NOTE: named _param_clients, NOT _clients — rclpy.Node uses self._clients
-        # internally to track all service clients; shadowing it breaks the executor.
-        self._param_clients = {
+        # Service clients for each camera.
+        # NOTE: not named _clients — rclpy.Node uses self._clients internally
+        # to track all service clients; shadowing it breaks the executor.
+        self._set_param_clients = {
             "cam0": self.create_client(
                 SetParameters, "/cam0/camera_node/set_parameters"
             ),
             "cam1": self.create_client(
                 SetParameters, "/cam1/camera_node/set_parameters"
+            ),
+        }
+        self._get_param_clients = {
+            "cam0": self.create_client(
+                GetParameters, "/cam0/camera_node/get_parameters"
+            ),
+            "cam1": self.create_client(
+                GetParameters, "/cam1/camera_node/get_parameters"
             ),
         }
 
@@ -281,12 +259,14 @@ class AutoCalNode(Node):
         if self._force_cal:
             self.get_logger().info(
                 f"AutoCalNode ready — force_cal active, starting immediately. "
-                f"Exposure limit: {self._max_exposure_us} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
+                f"Convergence: {CONVERGE_FRAMES} stable frames in "
+                f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%]"
             )
         else:
             self.get_logger().info(
                 f"AutoCalNode ready — waiting for {ALT_THRESHOLD_M} m AGL. "
-                f"Exposure limit: {self._max_exposure_us} µs | Gain limit: {max(GAIN_STEPS):.1f}×"
+                f"Convergence: {CONVERGE_FRAMES} stable frames in "
+                f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%]"
             )
 
     # -----------------------------------------------------------------------
@@ -326,16 +306,12 @@ class AutoCalNode(Node):
             self._latest_spec = list(msg.values)
 
     # -----------------------------------------------------------------------
-    # Parameter setting
+    # Parameter get / set
     # -----------------------------------------------------------------------
 
     def _set_params(self, cam: str, params: list, timeout: float = 5.0) -> bool:
-        """Submit a SetParameters call and poll for completion.
-
-        The executor (MultiThreadedExecutor, main thread) will process the
-        service response and resolve the future; this thread polls until done.
-        """
-        client = self._param_clients[cam]
+        """Submit a SetParameters call and poll for completion."""
+        client = self._set_param_clients[cam]
         if not client.wait_for_service(timeout_sec=timeout):
             self.get_logger().error(
                 f"{cam}: set_parameters service unavailable"
@@ -363,8 +339,6 @@ class AutoCalNode(Node):
 
         # The libcamera Raspberry Pi IPA returns successful=False for ExposureTime
         # when ExposureTimeMode is also active, but the value IS applied anyway.
-        # Treat this specific conflict as a known-spurious flag rather than a real
-        # failure — the binary search still converges correctly.
         SPURIOUS = "ExposureTimeMode and ExposureTime must not be set simultaneously"
         spurious = [(n, r) for n, r in rejected if SPURIOUS in r]
         real = [(n, r) for n, r in rejected if SPURIOUS not in r]
@@ -388,6 +362,35 @@ class AutoCalNode(Node):
             return False
         return True
 
+    def _get_ae_params(self, cam: str, timeout: float = 5.0) -> tuple[int, float]:
+        """Read ae_exposure_time_us and ae_analogue_gain from the camera node.
+
+        These parameters are updated each frame by camera_ros from libcamera
+        request metadata and reflect the values the IPA actually applied.
+        """
+        client = self._get_param_clients[cam]
+        if not client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().error(f"{cam}: get_parameters service unavailable")
+            return 5000, 1.0
+        req = GetParameters.Request()
+        req.names = ["ae_exposure_time_us", "ae_analogue_gain"]
+        future = client.call_async(req)
+        deadline = time.monotonic() + timeout
+        while not future.done():
+            if time.monotonic() > deadline:
+                self.get_logger().error(f"{cam}: get_parameters timed out")
+                return 5000, 1.0
+            time.sleep(0.01)
+        result = future.result()
+        if result is None or len(result.values) < 2:
+            self.get_logger().error(
+                f"{cam}: get_parameters returned unexpected result"
+            )
+            return 5000, 1.0
+        exp_us = int(result.values[0].integer_value)
+        gain = float(result.values[1].double_value)
+        return exp_us, gain
+
     # -----------------------------------------------------------------------
     # Frame acquisition (blocks the calling background thread)
     # -----------------------------------------------------------------------
@@ -403,122 +406,68 @@ class AutoCalNode(Node):
         with lock:
             return getattr(self, buf_attr).copy()
 
-    def _settled_frame(self, cam: str) -> np.ndarray | None:
-        """Discard SETTLE_FRAMES then return the next frame."""
-        for _ in range(SETTLE_FRAMES):
-            if self._next_frame(cam) is None:
-                return None
-        return self._next_frame(cam)
-
     # -----------------------------------------------------------------------
-    # Exposure binary search
+    # AE convergence wait
     # -----------------------------------------------------------------------
 
-    def _calibrate(self, cam: str) -> tuple[int, float]:
-        """
-        Binary-search ExposureTime at increasing gain levels until both
-        BRIGHT_CEIL and DARK_FLOOR constraints are satisfied.
+    def _wait_for_ae(self, cam: str) -> tuple[int, float]:
+        """Wait for libcamera AE to settle, then read back and return
+        (exposure_us, gain).
 
-        Returns (locked_exposure_us, locked_gain).
+        Declares convergence once CONVERGE_FRAMES consecutive frames have
+        bright_99 < BRIGHT_CEIL and dark_05 > DARK_FLOOR. If convergence
+        doesn't happen within CONVERGE_TIMEOUT_S, locks at the current state.
         """
         analyze = _analyze_cam0 if cam == "cam0" else _analyze_cam1
-        dtype_max = 65535.0  # both cameras configured for 16-bit output
-
+        dtype_max = 65535.0
         bright_thresh = BRIGHT_CEIL * dtype_max
         dark_thresh = DARK_FLOOR * dtype_max
 
-        final_exposure = self._max_exposure_us
-        final_gain = GAIN_STEPS[-1]
+        consecutive = 0
+        deadline = time.monotonic() + CONVERGE_TIMEOUT_S
 
-        for gain in GAIN_STEPS:
-            lo, hi = MIN_EXPOSURE_US, self._max_exposure_us
-            exposure = (lo + hi) // 2
+        self.get_logger().info(
+            f"{cam}: waiting for AE to converge "
+            f"({CONVERGE_FRAMES} consecutive frames in "
+            f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%])"
+        )
 
-            self.get_logger().info(
-                f"{cam}: starting binary search — "
-                f"gain={gain:.1f}  exposure range [{lo}, {hi}] µs"
+        while time.monotonic() < deadline:
+            frame = self._next_frame(cam)
+            if frame is None:
+                continue
+
+            bright_99, dark_05 = analyze(frame)
+            self.get_logger().debug(
+                f"{cam}: bright_99={bright_99/dtype_max*100:.1f}%  "
+                f"dark_05={dark_05/dtype_max*100:.1f}%  "
+                f"stable={consecutive}/{CONVERGE_FRAMES}"
             )
 
-            # Step 1: disable AE and set gain. Use _settled_frame (not _next_frame)
-            # to drain buffered frames so the parameter lands on a fresh frame,
-            # not on one that was already queued before the request was sent.
-            self.get_logger().debug(f"{cam}: sending AeEnable=False, gain={gain:.1f}")
-            ok1 = self._set_params(cam, [
-                _param("AeEnable", False),
-                _param("AnalogueGain", gain),
-            ])
-            self.get_logger().debug(f"{cam}: AeEnable/gain set_params returned {ok1}, draining {SETTLE_FRAMES+1} frames")
-            self._settled_frame(cam)
-
-            # Step 2: AeEnable=False internally activates ExposureTimeMode=Manual.
-            # Clear it after it settles so ExposureTime can be set.
-            self.get_logger().debug(f"{cam}: sending ExposureTimeMode=0")
-            ok2 = self._set_params(cam, [_param("ExposureTimeMode", 0)])
-            self.get_logger().debug(f"{cam}: ExposureTimeMode set_params returned {ok2}, draining {SETTLE_FRAMES+1} frames")
-            self._settled_frame(cam)
-
-            # Step 3: now set ExposureTime.
-            self.get_logger().debug(f"{cam}: sending ExposureTime={exposure}")
-            ok3 = self._set_params(cam, [_param("ExposureTime", exposure)])
-            self.get_logger().debug(f"{cam}: ExposureTime set_params returned {ok3}")
-
-            bright_99 = dark_05 = 0.0
-
-            for it in range(MAX_ITERS):
-                frame = self._settled_frame(cam)
-                if frame is None:
-                    self.get_logger().error(
-                        f"{cam}: no frame — aborting calibration, "
-                        f"locking at current settings"
-                    )
-                    return exposure, gain
-
-                bright_99, dark_05 = analyze(frame)
-                self.get_logger().info(
-                    f"{cam} iter {it}: exposure={exposure} µs  gain={gain:.1f}  "
-                    f"bright_99={bright_99 / dtype_max * 100:.1f}%  "
-                    f"dark_05={dark_05 / dtype_max * 100:.1f}%"
-                )
-
-                if bright_99 > bright_thresh:
-                    # Clipping — reduce exposure.
-                    hi = exposure
-                elif dark_05 < dark_thresh and exposure >= self._max_exposure_us:
-                    # Too dark even at max exposure for this gain — try next gain.
+            if bright_99 < bright_thresh and dark_05 > dark_thresh:
+                consecutive += 1
+                if consecutive >= CONVERGE_FRAMES:
+                    self.get_logger().info(f"{cam}: AE converged")
                     break
-                elif dark_05 < dark_thresh:
-                    # Too dark — increase exposure.
-                    lo = exposure
-                else:
-                    # Both constraints satisfied.
-                    self.get_logger().info(
-                        f"{cam}: converged — "
-                        f"exposure={exposure} µs  gain={gain:.1f}"
+            else:
+                if consecutive > 0:
+                    self.get_logger().debug(
+                        f"{cam}: stability reset — "
+                        f"bright_99={bright_99/dtype_max*100:.1f}%  "
+                        f"dark_05={dark_05/dtype_max*100:.1f}%"
                     )
-                    return exposure, gain
+                consecutive = 0
+        else:
+            self.get_logger().warn(
+                f"{cam}: AE did not converge within {CONVERGE_TIMEOUT_S:.0f}s — "
+                "locking at current state"
+            )
 
-                exposure = (lo + hi) // 2
-                self._set_params(cam, [_param("ExposureTime", exposure)])
-
-            # If the inner loop ended without a break and the last frame was
-            # actually acceptable (e.g. hit MAX_ITERS in a good region), return.
-            if dark_05 >= dark_thresh and bright_99 <= bright_thresh:
-                self.get_logger().info(
-                    f"{cam}: converged (max iters) — "
-                    f"exposure={exposure} µs  gain={gain:.1f}"
-                )
-                return exposure, gain
-
-            final_exposure = exposure
-            final_gain = gain
-
-        # Exhausted all gain levels — lock at last settings.
-        self.get_logger().warn(
-            f"{cam}: scene too dark at all gain levels — "
-            f"locking at exposure={final_exposure} µs  gain={final_gain:.1f}. "
-            "Check lighting conditions."
+        exp_us, gain = self._get_ae_params(cam)
+        self.get_logger().info(
+            f"{cam}: AE settled at ExposureTime={exp_us} µs  AnalogueGain={gain:.2f}×"
         )
-        return final_exposure, final_gain
+        return exp_us, gain
 
     # -----------------------------------------------------------------------
     # Main calibration sequence (background thread)
@@ -528,13 +477,12 @@ class AutoCalNode(Node):
         if not self._force_cal:
             self.get_logger().info(
                 f"auto_cal: waiting for drone to clear {ALT_THRESHOLD_M} m AGL "
-                "before starting exposure calibration and irradiance reference capture."
+                "before locking exposure and capturing irradiance reference."
             )
         while not self._above_alt.wait(timeout=5.0):
             self.get_logger().warn(
                 f"auto_cal: still waiting for {ALT_THRESHOLD_M} m AGL — "
-                "exposure and irradiance calibration have NOT run yet. "
-                "Cameras are in auto-exposure mode."
+                "cameras are in auto-exposure mode, images are not yet being saved."
             )
         sep = "=" * 62
         self.get_logger().info(
@@ -545,20 +493,17 @@ class AutoCalNode(Node):
             f"{sep}"
         )
 
-        # Calibrate cam0 and cam1 sequentially (independent cameras, different lenses).
         for cam in ("cam0", "cam1"):
-            exp_us, gain = self._calibrate(cam)
-            # Final lock: confirm AeEnable=False with the found settings.
+            exp_us, gain = self._wait_for_ae(cam)
             self._set_params(cam, [
                 _param("AeEnable", False),
                 _param("ExposureTime", exp_us),
                 _param("AnalogueGain", gain),
             ])
             self.get_logger().info(
-                f"{cam} locked — ExposureTime={exp_us} µs  AnalogueGain={gain:.1f}×"
+                f"{cam} locked — ExposureTime={exp_us} µs  AnalogueGain={gain:.2f}×"
             )
 
-        # Publish irradiance reference for stream_processor.
         with self._spec_lock:
             spec = self._latest_spec
 
@@ -576,7 +521,6 @@ class AutoCalNode(Node):
                 "Per-cycle irradiance correction will be skipped."
             )
 
-        # Signal panel_scan that exposure is locked and it can start imaging.
         self._pub_exposure_locked.publish(Bool(data=True))
         sep = "=" * 62
         self.get_logger().info(
@@ -593,8 +537,6 @@ class AutoCalNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    # MultiThreadedExecutor lets the background calibration thread make
-    # service calls while the main thread keeps spinning callbacks.
     executor = rclpy.executors.MultiThreadedExecutor()
     node = AutoCalNode()
     executor.add_node(node)

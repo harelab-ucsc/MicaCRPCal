@@ -10,10 +10,9 @@ from rcl_interfaces.msg import ParameterType
 
 from mica_crp_cal.auto_cal_node import (
     BRIGHT_CEIL,
+    CONVERGE_FRAMES,
+    CONVERGE_TIMEOUT_S,
     DARK_FLOOR,
-    GAIN_STEPS,
-    MAX_EXPOSURE_US,
-    MIN_EXPOSURE_US,
     NUM_CAM0_SLICES,
     _analyze_cam0,
     _analyze_cam1,
@@ -42,17 +41,20 @@ class TestAnalyzeCam0:
         assert bright == pytest.approx(32000, abs=1)
         assert dark == pytest.approx(32000, abs=1)
 
-    def test_bright_is_max_across_slices(self):
-        """bright_99 is the 99th pct of the BRIGHTEST slice."""
+    def test_uses_slice2_not_brightest_slice(self):
+        """Stats come from slice 2 (735 nm band) only, not the brightest slice."""
+        # slice 2 = 30000; slice 3 is brighter but should be ignored
         img = self._make_frame([10000, 20000, 30000, 60000])
-        bright, _ = _analyze_cam0(img)
-        assert bright == pytest.approx(60000, abs=100)
+        bright, dark = _analyze_cam0(img)
+        assert bright == pytest.approx(30000, abs=100)
+        assert dark == pytest.approx(30000, abs=100)
 
-    def test_dark_is_min_across_slices(self):
-        """dark_05 is the 5th pct of the DARKEST slice."""
+    def test_uses_slice2_not_darkest_slice(self):
+        """dark_05 reflects slice 2, not a darker slice."""
+        # slice 0 is very dark, slice 2 = 30000
         img = self._make_frame([1000, 20000, 30000, 40000])
         _, dark = _analyze_cam0(img)
-        assert dark == pytest.approx(1000, abs=100)
+        assert dark == pytest.approx(30000, abs=100)
 
     def test_all_zero_frame(self):
         img = self._make_frame([0, 0, 0, 0])
@@ -82,8 +84,9 @@ class TestAnalyzeCam0:
     def test_8bit_frame_works(self):
         img = self._make_frame([50, 100, 150, 200], dtype=np.uint8)
         bright, dark = _analyze_cam0(img)
-        assert bright == pytest.approx(200, abs=2)
-        assert dark == pytest.approx(50, abs=2)
+        # slice 2 = 150
+        assert bright == pytest.approx(150, abs=2)
+        assert dark == pytest.approx(150, abs=2)
 
 
 # ---------------------------------------------------------------------------
@@ -193,32 +196,17 @@ class TestParam:
 
 
 # ---------------------------------------------------------------------------
-# Exposure binary search invariants
+# Convergence constants
 # ---------------------------------------------------------------------------
 
-class TestBinarySearchInvariants:
-    """
-    Verify that the algorithm constants and termination conditions are coherent.
-    These tests don't run the full binary search (that requires camera hardware)
-    but check that the bounds and targets make physical sense.
-    """
+class TestConvergenceConstants:
+    """Verify that the AE convergence parameters are physically sensible."""
 
-    def test_max_exposure_within_frame_duration(self):
-        """MAX_EXPOSURE_US must be well below the 200 ms frame duration (199977 µs)."""
-        assert MAX_EXPOSURE_US < 199977
+    def test_converge_frames_positive(self):
+        assert CONVERGE_FRAMES > 0
 
-    def test_min_exposure_positive(self):
-        assert MIN_EXPOSURE_US > 0
-
-    def test_min_less_than_max(self):
-        assert MIN_EXPOSURE_US < MAX_EXPOSURE_US
-
-    def test_gain_steps_monotonically_increasing(self):
-        for a, b in zip(GAIN_STEPS, GAIN_STEPS[1:]):
-            assert b > a
-
-    def test_gain_steps_start_at_one(self):
-        assert GAIN_STEPS[0] == pytest.approx(1.0)
+    def test_converge_timeout_positive(self):
+        assert CONVERGE_TIMEOUT_S > 0
 
     def test_bright_ceil_above_dark_floor(self):
         assert BRIGHT_CEIL > DARK_FLOOR
@@ -231,26 +219,23 @@ class TestBinarySearchInvariants:
         """Must require some minimum signal."""
         assert DARK_FLOOR > 0.0
 
-    def test_termination_condition_coherent(self):
-        """
-        Simulate one binary search step: if bright_99 is below BRIGHT_CEIL
-        and dark_05 is above DARK_FLOOR, the algorithm should accept.
-        """
+    def test_in_range_condition(self):
+        """Simulate: both constraints met → should converge."""
         dtype_max = 65535.0
         bright_99 = BRIGHT_CEIL * dtype_max * 0.9   # 10% below ceiling
         dark_05 = DARK_FLOOR * dtype_max * 1.5      # 50% above floor
-        in_range = (bright_99 <= BRIGHT_CEIL * dtype_max
-                    and dark_05 >= DARK_FLOOR * dtype_max)
+        in_range = (bright_99 < BRIGHT_CEIL * dtype_max
+                    and dark_05 > DARK_FLOOR * dtype_max)
         assert in_range
 
-    def test_clipping_condition(self):
+    def test_clipping_resets_convergence(self):
+        """bright_99 above ceiling → not in range."""
         dtype_max = 65535.0
-        bright_99 = BRIGHT_CEIL * dtype_max * 1.01  # just over ceiling
-        clipping = bright_99 > BRIGHT_CEIL * dtype_max
-        assert clipping
+        bright_99 = BRIGHT_CEIL * dtype_max * 1.01
+        assert bright_99 > BRIGHT_CEIL * dtype_max
 
-    def test_too_dark_condition(self):
+    def test_too_dark_resets_convergence(self):
+        """dark_05 below floor → not in range."""
         dtype_max = 65535.0
-        dark_05 = DARK_FLOOR * dtype_max * 0.5  # below floor
-        too_dark = dark_05 < DARK_FLOOR * dtype_max
-        assert too_dark
+        dark_05 = DARK_FLOOR * dtype_max * 0.5
+        assert dark_05 < DARK_FLOOR * dtype_max

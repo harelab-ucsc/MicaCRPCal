@@ -54,8 +54,9 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
 
-WINDOW_SIZE = 30   # sliding window length in frames (~10 s at 3 Hz)
-CONFIRM_HITS = 3   # detections required within the window
+WINDOW_SIZE = 30    # sliding window length in frames (~10 s at 3 Hz)
+CONFIRM_HITS = 3    # detections required within the window
+CONFIRM_FRAMES = CONFIRM_HITS   # alias used by tests and docstring
 NUM_SLICES = 4
 
 # If no QR detected after this many seconds, start cycling through exposures.
