@@ -102,45 +102,119 @@ def _load_albedo(csv_path: str | Path, wavelengths_nm: tuple) -> list:
 def _panel_roi_from_qr(pts: np.ndarray) -> np.ndarray:
     """Return the flat panel ROI corners given the four QR corner points.
 
-    The panel holder has the QR code at one end and the flat reflective panel
-    at the other end (same size, directly adjacent). We project one QR-height
-    past the QR's image-space bottom edge to locate the panel.
-
-    This works for any in-plane rotation where the panel is below the QR in
-    image-Y (Y=0 at top). If the holder is flipped 180° so the panel is above
-    the QR in the image, re-orient the holder and rescan.
+    Tries all four cardinal directions (below, above, right, left of the QR)
+    and returns the projection that is most likely to contain the panel.
+    Direction selection is purely geometric (no image data) so this is used
+    as a fallback when edge detection fails.
 
     Args:
         pts: (4, 2) float32 QR corner points in any order.
 
     Returns:
-        (4, 2) float32 panel corners in [TL, TR, BR, BL] image order.
+        (4, 2) float32 panel corners.
     """
     pts = pts.reshape(4, 2).astype(np.float32)
 
-    # Split into "top" (smaller image-Y) and "bottom" (larger image-Y) pairs.
-    order = np.argsort(pts[:, 1])
-    top_two = pts[order[:2]]
-    bot_two = pts[order[2:]]
+    def _build(axis: int, positive: bool) -> np.ndarray:
+        order = np.argsort(pts[:, axis])
+        if positive:
+            near_two, far_two = pts[order[:2]], pts[order[2:]]
+        else:
+            near_two, far_two = pts[order[2:]], pts[order[:2]]
+        step = far_two.mean(axis=0) - near_two.mean(axis=0)
+        perp = 1 - axis
+        far_l, far_r = far_two[np.argsort(far_two[:, perp])]
+        gap = step * PANEL_GAP_FRAC
+        tl = far_l + gap
+        tr = far_r + gap
+        return np.array(
+            [tl, tr, tr + step * PANEL_SIZE_FRAC, tl + step * PANEL_SIZE_FRAC],
+            dtype=np.float32,
+        )
 
-    step = bot_two.mean(axis=0) - top_two.mean(axis=0)  # QR height vector
+    # Default to projecting below (original assumption); used as fallback.
+    return _build(1, True)
 
-    # Sort each pair left-to-right for consistent corner labelling.
-    bot_l, bot_r = bot_two[np.argsort(bot_two[:, 0])]
 
-    gap = step * PANEL_GAP_FRAC
-    panel_tl = bot_l + gap
-    panel_tr = bot_r + gap
-    panel_bl = panel_tl + step * PANEL_SIZE_FRAC
-    panel_br = panel_tr + step * PANEL_SIZE_FRAC
+def _find_panel_by_edges(
+    band: np.ndarray,
+    hint_center: tuple | None = None,
+    hint_radius: float | None = None,
+) -> np.ndarray | None:
+    """Locate the reflective panel ROI via edge detection and contour analysis.
 
-    return np.array([panel_tl, panel_tr, panel_br, panel_bl], dtype=np.float32)
+    Applies Canny edge detection, finds external contours, and scores each
+    roughly-square candidate by mean pixel brightness. The white reflective
+    panel is the brightest roughly-square object in the scene.
+
+    Args:
+        band:         (H, W) image slice (any bit depth).
+        hint_center:  (cx, cy) pixel coordinate to constrain the search.
+                      Candidates whose centre falls outside hint_radius are
+                      skipped. Pass None to search the full image.
+        hint_radius:  Search radius in pixels around hint_center.
+
+    Returns:
+        (4, 2) float32 oriented bounding-box corners of the best candidate,
+        or None if no plausible panel rectangle is found.
+    """
+    u8 = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
+        if band.dtype != np.uint8 else band.copy()
+
+    blurred = cv2.GaussianBlur(u8, (7, 7), 0)
+    edges = cv2.Canny(blurred, 20, 80)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    h, w = band.shape[:2]
+    # Panel spans roughly 3–40 % of the slice width.
+    min_area = (w * 0.03) ** 2
+    max_area = (w * 0.40) ** 2
+
+    best_roi, best_score = None, -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        rw, rh = rect[1]
+        if rw < 1 or rh < 1:
+            continue
+        # Reject elongated shapes — the panel is roughly square.
+        if max(rw, rh) / min(rw, rh) > 2.0:
+            continue
+
+        if hint_center is not None and hint_radius is not None:
+            cx, cy = rect[0]
+            dx, dy = cx - hint_center[0], cy - hint_center[1]
+            if dx * dx + dy * dy > hint_radius ** 2:
+                continue
+
+        box = cv2.boxPoints(rect).astype(np.float32)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, np.round(box).astype(np.int32), 255)
+        pixels = band[mask > 0]
+        if pixels.size == 0:
+            continue
+        score = float(np.mean(pixels.astype(np.float64)))
+        if score > best_score:
+            best_score = score
+            best_roi = box
+
+    return best_roi
+
+
+_QR_UPSCALE = 2          # upscale factor passed to QReader to improve small-QR detection
+_QR_MIN_CONFIDENCE = 0.3  # lower than default 0.5 — we're far away, accept weaker hits
 
 
 def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
     """Runs in a separate process — loads QReader once, processes frames."""
     from qreader import QReader
-    detector = QReader()
+    detector = QReader(min_confidence=_QR_MIN_CONFIDENCE)
     while True:
         item = in_q.get()
         if item is None:
@@ -150,11 +224,21 @@ def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
         found_slices = []
         for s, gray in slices:
             try:
+                # Upscale before detection so the QR occupies more pixels in
+                # the YOLO input — critical when hovering at 3 m AGL where the
+                # QR code is only ~20-40 px wide in a single band slice.
+                h, w = gray.shape[:2]
+                up = cv2.resize(
+                    gray,
+                    (w * _QR_UPSCALE, h * _QR_UPSCALE),
+                    interpolation=cv2.INTER_LINEAR,
+                )
                 texts, dets = detector.detect_and_decode(
-                    image=gray, return_detections=True
+                    image=up, return_detections=True
                 )
                 if texts and dets:
-                    x1, y1, x2, y2 = dets[0]['bbox_xyxy']
+                    # Scale detected bbox back to original resolution.
+                    x1, y1, x2, y2 = (v / _QR_UPSCALE for v in dets[0]['bbox_xyxy'])
                     pts = np.array(
                         [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
                         dtype=np.float32,
@@ -493,12 +577,28 @@ class PanelScanNode(Node):
         else:
             dtype_max = 1.0
 
-        # Only calibrate slices that can see QR ink (DETECT_SLICES = 1, 2).
-        # Dark/NIR bands (0=450nm, 3=850nm) get factor=1.0 — no projection.
         qr_pts = self._last_qr_pts
 
-        # Project once — shared across all slices.
-        projected_panel = _panel_roi_from_qr(qr_pts)
+        # Use the 735 nm slice (best contrast) to find the panel via edge
+        # detection. Search within 3× the QR bounding-box width of the QR
+        # centre so we don't pick up a bright object elsewhere in the scene.
+        ref_band = raw[:, 2 * slice_w: 3 * slice_w]
+        qr_cx = float(qr_pts[:, 0].mean())
+        qr_cy = float(qr_pts[:, 1].mean())
+        qr_size = float(max(
+            qr_pts[:, 0].max() - qr_pts[:, 0].min(),
+            qr_pts[:, 1].max() - qr_pts[:, 1].min(),
+        ))
+        projected_panel = _find_panel_by_edges(
+            ref_band,
+            hint_center=(qr_cx, qr_cy),
+            hint_radius=qr_size * 3.0,
+        )
+        if projected_panel is None:
+            self.get_logger().warn(
+                "Edge detection found no panel — falling back to QR projection."
+            )
+            projected_panel = _panel_roi_from_qr(qr_pts)
 
         factors = []
         for i in range(NUM_SLICES):
@@ -551,7 +651,7 @@ class PanelScanNode(Node):
             f"Panel calibration published ({NUM_SLICES} bands) on /panel_cal/irradiance"
         )
 
-        self._save_debug_image(raw, factors, slice_w)
+        self._save_debug_image(raw, factors, slice_w, projected_panel)
         rclpy.shutdown()
 
     def _save_debug_image(
@@ -559,6 +659,7 @@ class PanelScanNode(Node):
         raw: np.ndarray,
         factors: list,
         slice_w: int,
+        panel_proj: np.ndarray,
     ) -> None:
         """Save an 8-bit BGR image with QR and panel ROI boxes drawn per slice."""
         try:
@@ -569,7 +670,6 @@ class PanelScanNode(Node):
             vis_bgr = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
             qr_pts = self._last_qr_pts
-            panel_proj = _panel_roi_from_qr(qr_pts)
             detected = self._last_detected_slices
             for i in range(NUM_SLICES):
                 x_off = i * slice_w

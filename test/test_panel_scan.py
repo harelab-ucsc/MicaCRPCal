@@ -9,6 +9,7 @@ independently of the ROS executor.
 import math
 import os
 import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -19,9 +20,12 @@ from mica_crp_cal.panel_scan_node import (
     NUM_SLICES,
     PANEL_GAP_FRAC,
     PANEL_SIZE_FRAC,
+    _find_panel_by_edges,
     _load_albedo,
     _panel_roi_from_qr,
 )
+
+_FIXTURE_DIR = Path(__file__).parent / "data"
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +390,151 @@ class TestQRConfirmationLogic:
         bboxes = [None, None, None, None]
         detected = any(b is not None for b in bboxes)
         assert not detected
+
+
+# ---------------------------------------------------------------------------
+# _find_panel_by_edges — real-image fixture test
+#
+# Fixture: test/data/panel_cal_debug.png
+#   A debug frame captured with the panel holder oriented sideways (panel to
+#   the right of the QR code rather than below it). The old geometric
+#   projection always went straight down from the QR and landed on background;
+#   _find_panel_by_edges must recover the correct ROI regardless of rotation.
+#
+# The debug image is a normalised 8-bit BGR composite of all four cam0 band
+# slices laid side-by-side. Slice 2 (columns 2560-3840) is the 735 nm band
+# and is the only one bright enough for reliable edge detection.
+# The green polyline drawn on the image marks where QReader found the QR tag.
+# ---------------------------------------------------------------------------
+
+_DEBUG_IMAGE = _FIXTURE_DIR / "panel_cal_debug.png"
+_SLICE_IDX_735 = 2   # 735 nm band — best contrast for QR and panel
+
+
+def _load_735nm_slice():
+    """Return the 735 nm band as a uint8 grayscale array."""
+    img = cv2.imread(str(_DEBUG_IMAGE))
+    assert img is not None, f"Could not load fixture: {_DEBUG_IMAGE}"
+    h, w = img.shape[:2]
+    sw = w // NUM_SLICES
+    sl = img[:, _SLICE_IDX_735 * sw: (_SLICE_IDX_735 + 1) * sw]
+    return cv2.cvtColor(sl, cv2.COLOR_BGR2GRAY)
+
+
+def _qr_center_from_debug_image():
+    """
+    Derive the QR centre in 735 nm slice-local pixel coords by finding the
+    green polyline pixels (drawn by _save_debug_image) in the debug image.
+    """
+    img = cv2.imread(str(_DEBUG_IMAGE))
+    h, w = img.shape[:2]
+    sw = w // NUM_SLICES
+    sl = img[:, _SLICE_IDX_735 * sw: (_SLICE_IDX_735 + 1) * sw].astype(int)
+    g, r, b = sl[:, :, 1], sl[:, :, 2], sl[:, :, 0]
+    green_mask = (g > 150) & (g > r * 2) & (g > b * 2)
+    ys, xs = np.where(green_mask)
+    assert len(xs) > 0, "No green QR box found in fixture image"
+    return float(xs.mean()), float(ys.mean())
+
+
+@pytest.mark.skipif(
+    not _DEBUG_IMAGE.exists(),
+    reason="fixture panel_cal_debug.png not present",
+)
+class TestFindPanelByEdgesFixture:
+
+    def test_panel_found(self):
+        """Edge detection must return a non-None result for the fixture image."""
+        gray = _load_735nm_slice()
+        cx, cy = _qr_center_from_debug_image()
+        result = _find_panel_by_edges(gray, hint_center=(cx, cy), hint_radius=300.0)
+        assert result is not None, (
+            "_find_panel_by_edges returned None — panel not detected in fixture"
+        )
+
+    def test_result_shape(self):
+        gray = _load_735nm_slice()
+        cx, cy = _qr_center_from_debug_image()
+        result = _find_panel_by_edges(gray, hint_center=(cx, cy), hint_radius=300.0)
+        assert result is not None
+        assert result.shape == (4, 2)
+        assert result.dtype == np.float32
+
+    def test_panel_is_roughly_square(self):
+        """The reflective panel is square — aspect ratio must be < 2."""
+        gray = _load_735nm_slice()
+        cx, cy = _qr_center_from_debug_image()
+        result = _find_panel_by_edges(gray, hint_center=(cx, cy), hint_radius=300.0)
+        assert result is not None
+        rect = cv2.minAreaRect(result)
+        rw, rh = rect[1]
+        aspect = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else float("inf")
+        assert aspect < 2.0, f"Panel ROI aspect ratio {aspect:.2f} — too elongated"
+
+    def test_panel_is_not_below_qr(self):
+        """
+        Regression for the sideways-holder bug: in this fixture the panel sits
+        to the right of the QR code, NOT below it. The Y offset from QR centre
+        to panel centre must be much smaller than the X offset.
+        """
+        gray = _load_735nm_slice()
+        qr_cx, qr_cy = _qr_center_from_debug_image()
+        result = _find_panel_by_edges(gray, hint_center=(qr_cx, qr_cy), hint_radius=300.0)
+        assert result is not None
+        pan_cx, pan_cy = result[:, 0].mean(), result[:, 1].mean()
+        dx = abs(pan_cx - qr_cx)
+        dy = abs(pan_cy - qr_cy)
+        assert dx > dy, (
+            f"Panel appears below the QR (dx={dx:.1f} < dy={dy:.1f}); "
+            "sideways orientation not handled correctly"
+        )
+
+    def test_no_hint_still_finds_panel(self):
+        """Without a position hint the function searches the whole slice."""
+        gray = _load_735nm_slice()
+        result = _find_panel_by_edges(gray)
+        assert result is not None, (
+            "_find_panel_by_edges returned None without a position hint"
+        )
+
+    def test_save_annotated_image(self, tmp_path):
+        """Draw QR centre and detected panel ROI on the fixture image and save
+        the annotated composite to test-artifacts/panel_detection_annotated.png.
+
+        Not a correctness assertion — the image is exported as a CI artifact
+        so the detection result can be inspected visually without running the
+        full flight stack.
+        """
+        gray = _load_735nm_slice()
+        qr_cx, qr_cy = _qr_center_from_debug_image()
+
+        result = _find_panel_by_edges(gray, hint_center=(qr_cx, qr_cy), hint_radius=300.0)
+
+        # Use the clean grayscale band as background — not the original debug
+        # image which has old annotation boxes already baked in.
+        vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+        # QR centre: cyan cross-hair.
+        cx_i, cy_i = int(round(qr_cx)), int(round(qr_cy))
+        cv2.drawMarker(vis, (cx_i, cy_i), (255, 255, 0),
+                       cv2.MARKER_CROSS, markerSize=30, thickness=2)
+        cv2.putText(vis, "QR", (cx_i + 8, cy_i - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        if result is not None:
+            pts_i = np.round(result).astype(np.int32)
+            cv2.polylines(vis, [pts_i], isClosed=True, color=(0, 255, 0), thickness=3)
+            pan_cx = int(round(result[:, 0].mean()))
+            pan_cy = int(round(result[:, 1].mean()))
+            cv2.putText(vis, "panel", (pan_cx + 5, pan_cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        else:
+            cv2.putText(vis, "PANEL NOT FOUND", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+        out_dir = Path("/tmp/test-artifacts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "panel_detection_annotated.png"
+        cv2.imwrite(str(out_path), vis)
+        # Always pass — image is for human inspection only.
+        assert out_path.exists()
