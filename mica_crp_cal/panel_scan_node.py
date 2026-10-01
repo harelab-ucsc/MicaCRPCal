@@ -39,6 +39,7 @@ extension, which applies per pixel:
 """
 
 import multiprocessing as mp
+import time
 from collections import deque
 from pathlib import Path
 
@@ -50,7 +51,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
-
 WINDOW_SIZE = 30    # sliding window length in frames (~10 s at 3 Hz)
 CONFIRM_HITS = 3    # detections required within the window
 CONFIRM_FRAMES = CONFIRM_HITS   # alias used by tests and docstring
@@ -69,6 +69,39 @@ CAM0_BAND_NM = (450, 695, 735, 850)
 PANEL_GAP_FRAC = 0.434
 PANEL_SIZE_FRAC = 1.205
 
+# Default scan timeout (seconds). If no QR code is confirmed within this window
+# after /cal/exposure_locked, fallback unity calibration factors [1.0, 1.0, 1.0, 1.0]
+# are published on /panel_cal/irradiance so stream_processor does not discard the flight.
+SCAN_TIMEOUT_S = 30.0
+
+# Linear scale factor to isolate the clean white center of the CRP panel,
+# excluding the black border and target mounting edges (0.5 = central 50% linear / 25% area).
+PANEL_CENTER_SCALE = 0.5
+
+# Physical QR code dimension on RP06 panel target (83 mm = 0.083 m).
+QR_SIZE_M = 0.083
+
+# Camera optical positions (X_opt, Y_opt) in meters relative to rig center.
+# Optical frame: X=right, Y=down, looking nadir.
+# Derived from CAD / sensor_params/birdseye_v2_camchain_intrinsics.yaml:
+#   multispec_1 (slice 0): (+0.021906, -0.022001)
+#   multispec_2 (slice 1): (+0.021906, +0.021811)
+#   multispec_3 (slice 2): (-0.021906, +0.021811)
+#   multispec_4 (slice 3): (-0.021906, -0.022001)
+CAM_OPTICAL_POS_M = (
+    np.array([ 0.021906, -0.022001], dtype=np.float32),  # slice 0 (450 nm)
+    np.array([ 0.021906,  0.021811], dtype=np.float32),  # slice 1 (695 nm)
+    np.array([-0.021906,  0.021811], dtype=np.float32),  # slice 2 (735 nm)
+    np.array([-0.021906, -0.022001], dtype=np.float32),  # slice 3 (850 nm)
+)
+
+# Optical centers (cx, cy) in pixels from calibration:
+CAM_OPTICAL_CENTER = (
+    np.array([653.007, 407.899], dtype=np.float32),  # slice 0
+    np.array([609.171, 411.645], dtype=np.float32),  # slice 1
+    np.array([627.705, 400.242], dtype=np.float32),  # slice 2
+    np.array([604.458, 413.133], dtype=np.float32),  # slice 3
+)
 # Default CRP CSV — bundled alongside this file.
 _DEFAULT_CSV = Path(__file__).parent / "data" / "RP06-2120405-OB.csv"
 
@@ -125,6 +158,50 @@ def _panel_roi_from_qr(pts: np.ndarray) -> np.ndarray:
 
     # Default to projecting below (original assumption); used as fallback.
     return _build(1, True)
+
+def _extract_panel_center(
+    panel_pts: np.ndarray,
+    scale: float = PANEL_CENTER_SCALE,
+) -> np.ndarray:
+    """Shrink the panel polygon towards its centroid to isolate the clean white center,
+    excluding the surrounding black border and mounting frame.
+
+    Args:
+        panel_pts: (N, 2) array of panel polygon vertices.
+        scale:     Linear scale factor (0.5 = central 50% linear / 25% area).
+
+    Returns:
+        (N, 2) array of vertices scaled towards the centroid.
+    """
+    pts = np.asarray(panel_pts, dtype=np.float32).reshape(-1, 2)
+    centroid = pts.mean(axis=0)
+    return centroid + scale * (pts - centroid)
+
+
+def _compute_slice_offset(
+    src_slice: int,
+    dst_slice: int,
+    qr_size_px: float,
+) -> np.ndarray:
+    """Calculate the pixel translation from src_slice to dst_slice image coordinates
+    accounting for relative camera positions (baseline parallax) and optical centers.
+
+    Args:
+        src_slice:   Index of reference camera slice (0-3).
+        dst_slice:   Index of target camera slice (0-3).
+        qr_size_px:  Detected QR bounding box width/height in pixels.
+
+    Returns:
+        (2,) float32 [delta_x, delta_y] offset in pixels.
+    """
+    if src_slice == dst_slice or qr_size_px <= 0:
+        return np.zeros(2, dtype=np.float32)
+
+    delta_pos = CAM_OPTICAL_POS_M[dst_slice] - CAM_OPTICAL_POS_M[src_slice]
+    # Parallax shift: d = -delta_pos * (f / Z) where f / Z = qr_size_px / QR_SIZE_M
+    shift_baseline = -delta_pos * (qr_size_px / QR_SIZE_M)
+    shift_center = CAM_OPTICAL_CENTER[dst_slice] - CAM_OPTICAL_CENTER[src_slice]
+    return (shift_baseline + shift_center).astype(np.float32)
 
 
 def _find_panel_by_edges(
@@ -213,6 +290,7 @@ def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
         frame_id, slices = item  # slices: list of (slice_idx, gray uint8)
         found_corners = None
         found_slices = []
+        slice_corners: dict[int, np.ndarray] = {}
         for s, gray in slices:
             try:
                 # Upscale before detection so the QR occupies more pixels in
@@ -234,13 +312,13 @@ def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
                         [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
                         dtype=np.float32,
                     )
+                    slice_corners[s] = pts
                     if found_corners is None:
                         found_corners = pts
                     found_slices.append(s)
             except Exception:
                 pass
-        out_q.put((frame_id, found_corners, found_slices))
-
+        out_q.put((frame_id, found_corners, found_slices, slice_corners))
 
 def _snap_to_corners(
     band: np.ndarray,
@@ -308,9 +386,11 @@ class PanelScanNode(Node):
         self._bridge = CvBridge()
         self._window: deque = deque(maxlen=WINDOW_SIZE)
         self._frame_id: int = 0
+        self._frame_buffer: dict[int, np.ndarray] = {}  # Dictionary buffer indexed by frame_id
         self._first_frame_saved: bool = False
         self._last_qr_pts = None          # corners from last confirmed detection
         self._last_detected_slices: list = []
+        self._last_slice_corners: dict[int, np.ndarray] = {}
 
         # QReader process — created lazily in _exposure_locked_cb so YOLO
         # doesn't consume CPU during auto_cal's binary search.
@@ -321,6 +401,10 @@ class PanelScanNode(Node):
         self._done = False
         self._last_raw: np.ndarray | None = None
         self._last_bboxes: list[np.ndarray | None] = [None] * NUM_SLICES
+
+        self.declare_parameter("scan_timeout_s", SCAN_TIMEOUT_S)
+        self._scan_timeout_s: float = float(self.get_parameter("scan_timeout_s").value)
+        self._scan_start_time: float | None = None
 
         # Exposure-lock gate: QR scanning only starts once auto_cal has locked
         # the cameras. mean_panel_DN encodes ExposureTime — scanning before lock
@@ -396,6 +480,7 @@ class PanelScanNode(Node):
         if self._exposure_locked:
             return
         self._exposure_locked = True
+        self._scan_start_time = time.monotonic()
 
         # Start the QReader worker now — no point loading YOLO during auto_cal.
         self._qr_in = self._qr_ctx.Queue(maxsize=2)
@@ -426,14 +511,19 @@ class PanelScanNode(Node):
             )
             return
 
+        # Store raw frame in dictionary buffer indexed by frame_id
+        cur_id = self._frame_id
+        self._frame_id += 1
+        self._frame_buffer[cur_id] = raw
+
+        # Keep buffer bounded: prune frames older than ~20 s at 3 Hz
+        old_ids = [fid for fid in self._frame_buffer if fid < cur_id - 60]
+        for fid in old_ids:
+            del self._frame_buffer[fid]
+
         # Save the very first frame after exposure lock so the user can verify quality.
         if not self._first_frame_saved:
             self._first_frame_saved = True
-            self.get_logger().info(
-                f"First scan frame: {raw.shape[1]}x{raw.shape[0]} px, "
-                f"dtype={raw.dtype} — "
-                f"slice width={raw.shape[1] // NUM_SLICES} px per band"
-            )
             try:
                 import os
                 vis = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -459,31 +549,39 @@ class PanelScanNode(Node):
                 if raw.dtype != np.uint8 else band.copy()
             slices.append((s, gray))
         try:
-            self._qr_in.put_nowait((self._frame_id, slices))
+            self._qr_in.put_nowait((cur_id, slices))
         except Exception:
             pass  # queue full — skip this frame
-        self._frame_id += 1
 
         # Drain any completed results from the worker.
         while not self._qr_out.empty():
             try:
-                _, qr_corners, detected_slices = self._qr_out.get_nowait()
+                res = self._qr_out.get_nowait()
             except Exception:
                 break
 
+            if len(res) == 4:
+                res_id, qr_corners, detected_slices, slice_corners = res
+            else:
+                res_id, qr_corners, detected_slices = res
+                slice_corners = {detected_slices[0]: qr_corners} if detected_slices and qr_corners is not None else {}
+
             bboxes: list[np.ndarray | None] = [
-                qr_corners.reshape(1, 4, 2) if qr_corners is not None else None
-                for _ in range(NUM_SLICES)
+                slice_corners.get(i, qr_corners.reshape(1, 4, 2) if qr_corners is not None else None)
+                for i in range(NUM_SLICES)
             ]
             hit = qr_corners is not None
             self._window.append(hit)
             hits = sum(self._window)
 
             if hit:
-                self._last_raw = raw
+                # Retrieve the exact raw frame matching the QR detection from the dictionary buffer
+                matched_raw = self._frame_buffer.get(res_id, raw)
+                self._last_raw = matched_raw
                 self._last_bboxes = bboxes
                 self._last_qr_pts = qr_corners
                 self._last_detected_slices = detected_slices
+                self._last_slice_corners = slice_corners
                 self.get_logger().info(
                     f"QR located in slice(s) {detected_slices} "
                     f"({hits}/{CONFIRM_HITS} in last {len(self._window)} frames)"
@@ -491,7 +589,6 @@ class PanelScanNode(Node):
             if hits >= CONFIRM_HITS:
                 self._publish_calibration()
                 return
-
     def _watchdog(self) -> None:
         if self._done:
             return
@@ -501,16 +598,38 @@ class PanelScanNode(Node):
                 "/cal/exposure_locked — QR scan has not started yet."
             )
             return
+
+        if self._scan_start_time is not None:
+            elapsed = time.monotonic() - self._scan_start_time
+            if elapsed > self._scan_timeout_s:
+                self.get_logger().error(
+                    f"panel_scan: QR scan timed out after {elapsed:.1f} s "
+                    f"(limit: {self._scan_timeout_s:.1f} s) — triggering fallback"
+                )
+                self._publish_fallback_calibration(f"Timeout after {elapsed:.1f} s")
+                return
+
         self.get_logger().warn(
             "panel_scan: QR tag not yet detected — still scanning. "
             "Ensure the CRP panel is flat below the drone, QR tag visible, "
             "in direct sunlight with no shadow."
         )
 
-    # ------------------------------------------------------------------
-    # Calibration factor computation
-    # ------------------------------------------------------------------
-
+    def _publish_fallback_calibration(self, reason: str = "Scan timed out") -> None:
+        """Publish unity fallback factors [1.0, 1.0, 1.0, 1.0] if panel scan fails
+        or times out so stream_processor does not discard the flight."""
+        if self._done:
+            return
+        self._done = True
+        self.get_logger().error(
+            f"Panel scan failed ({reason}) — publishing fallback unity factors [1.0, 1.0, 1.0, 1.0] "
+            "on /panel_cal/irradiance so stream_processor does not discard the flight."
+        )
+        msg = Float32MultiArray()
+        msg.data = [1.0] * NUM_SLICES
+        self._pub.publish(msg)
+        self._frame_buffer.clear()
+        rclpy.shutdown()
     def _publish_calibration(self) -> None:
         self._done = True
 
@@ -520,7 +639,7 @@ class PanelScanNode(Node):
             self.get_logger().error(
                 "No valid frame stored — cannot compute calibration."
             )
-            rclpy.shutdown()
+            self._publish_fallback_calibration("No valid frame stored")
             return
 
         h, w = raw.shape[:2]
@@ -533,39 +652,57 @@ class PanelScanNode(Node):
             dtype_max = 1.0
 
         qr_pts = self._last_qr_pts
+        detected_slices = self._last_detected_slices
+        ref_slice = 2   # 735 nm band has best contrast for edge detection
+        src_slice = detected_slices[0] if detected_slices else ref_slice
 
-        # Use the 735 nm slice (best contrast) to find the panel via edge
-        # detection. Search within 3× the QR bounding-box width of the QR
-        # centre so we don't pick up a bright object elsewhere in the scene.
-        ref_band = raw[:, 2 * slice_w: 3 * slice_w]
-        qr_cx = float(qr_pts[:, 0].mean())
-        qr_cy = float(qr_pts[:, 1].mean())
         qr_size = float(max(
             qr_pts[:, 0].max() - qr_pts[:, 0].min(),
             qr_pts[:, 1].max() - qr_pts[:, 1].min(),
         ))
+
+        # Shift QR coordinates to ref_slice if detected in a different slice
+        offset_to_ref = _compute_slice_offset(src_slice, ref_slice, qr_size)
+        qr_pts_ref = qr_pts + offset_to_ref
+        qr_cx_ref = float(qr_pts_ref[:, 0].mean())
+        qr_cy_ref = float(qr_pts_ref[:, 1].mean())
+
+        # Use the 735 nm slice (best contrast) to find the panel via edge
+        # detection. Search within 3× the QR bounding-box width of the QR
+        # centre so we don't pick up a bright object elsewhere in the scene.
+        ref_band = raw[:, ref_slice * slice_w: (ref_slice + 1) * slice_w]
         projected_panel = _find_panel_by_edges(
             ref_band,
-            hint_center=(qr_cx, qr_cy),
+            hint_center=(qr_cx_ref, qr_cy_ref),
             hint_radius=qr_size * 3.0,
         )
         if projected_panel is None:
             self.get_logger().warn(
                 "Edge detection found no panel — falling back to QR projection."
             )
-            projected_panel = _panel_roi_from_qr(qr_pts)
+            projected_panel = _panel_roi_from_qr(qr_pts_ref)
 
         factors = []
+        per_slice_panels = []
         for i in range(NUM_SLICES):
             band = raw[:, i * slice_w: (i + 1) * slice_w]
 
             band_u8 = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if band.dtype != np.uint8 else band
-            panel_pts = _snap_to_corners(band_u8, projected_panel)
-            panel_pts_int = np.round(panel_pts).astype(np.int32)
+
+            # Account for camera positions: compute offset from reference slice to slice i
+            offset_i = _compute_slice_offset(ref_slice, i, qr_size)
+            panel_proj_i = projected_panel + offset_i
+
+            panel_pts = _snap_to_corners(band_u8, panel_proj_i)
+            per_slice_panels.append(panel_pts)
+
+            # Measure only the clean white center instead of the black border
+            white_center_pts = _extract_panel_center(panel_pts, scale=PANEL_CENTER_SCALE)
+            white_center_int = np.round(white_center_pts).astype(np.int32)
 
             mask = np.zeros(band.shape[:2], dtype=np.uint8)
-            cv2.fillConvexPoly(mask, panel_pts_int, 255)
+            cv2.fillConvexPoly(mask, white_center_int, 255)
 
             pixels = band[mask > 0]
             if pixels.size == 0:
@@ -606,7 +743,8 @@ class PanelScanNode(Node):
             f"Panel calibration published ({NUM_SLICES} bands) on /panel_cal/irradiance"
         )
 
-        self._save_debug_image(raw, factors, slice_w, projected_panel)
+        self._save_debug_image(raw, factors, slice_w, per_slice_panels)
+        self._frame_buffer.clear()
         rclpy.shutdown()
 
     def _save_debug_image(
@@ -614,9 +752,9 @@ class PanelScanNode(Node):
         raw: np.ndarray,
         factors: list,
         slice_w: int,
-        panel_proj: np.ndarray,
+        panel_proj,
     ) -> None:
-        """Save an 8-bit BGR image with QR and panel ROI boxes drawn per slice."""
+        """Save an 8-bit BGR image with QR, panel ROI, and white center boxes drawn per slice."""
         try:
             import os
 
@@ -632,10 +770,18 @@ class PanelScanNode(Node):
                 cv2.putText(vis_bgr, label, (x_off + 10, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
-                panel_global = panel_proj.copy()
+                panel_i = panel_proj[i] if isinstance(panel_proj, (list, tuple)) else panel_proj
+                panel_global = panel_i.copy()
                 panel_global[:, 0] += x_off
                 cv2.polylines(vis_bgr, [np.round(panel_global).astype(np.int32)],
                               isClosed=True, color=(255, 80, 0), thickness=4)
+
+                # Draw the clean white center ROI in cyan
+                center_i = _extract_panel_center(panel_i, scale=PANEL_CENTER_SCALE)
+                center_global = center_i.copy()
+                center_global[:, 0] += x_off
+                cv2.polylines(vis_bgr, [np.round(center_global).astype(np.int32)],
+                              isClosed=True, color=(0, 255, 255), thickness=2)
 
                 # QR box only where it was actually detected.
                 if i in detected:
@@ -662,3 +808,4 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
+

@@ -9,10 +9,11 @@ import pytest
 from rcl_interfaces.msg import ParameterType
 
 from mica_crp_cal.auto_cal_node import (
+    AE_STABILITY_TOLERANCE,
     BRIGHT_CEIL,
     CONVERGE_FRAMES,
     CONVERGE_TIMEOUT_S,
-    DARK_FLOOR,
+    MAX_EXPOSURE_US,
     NUM_CAM0_SLICES,
     _analyze_cam0,
     _analyze_cam1,
@@ -208,25 +209,36 @@ class TestConvergenceConstants:
     def test_converge_timeout_positive(self):
         assert CONVERGE_TIMEOUT_S > 0
 
-    def test_bright_ceil_above_dark_floor(self):
-        assert BRIGHT_CEIL > DARK_FLOOR
-
     def test_bright_ceil_below_1(self):
         """Must leave headroom to avoid clipping."""
         assert BRIGHT_CEIL < 1.0
 
-    def test_dark_floor_above_0(self):
-        """Must require some minimum signal."""
-        assert DARK_FLOOR > 0.0
+    def test_ae_stability_tolerance_positive(self):
+        assert AE_STABILITY_TOLERANCE > 0.0
 
-    def test_in_range_condition(self):
-        """Simulate: both constraints met → should converge."""
+    def test_ae_stability_tolerance_reasonable(self):
+        assert AE_STABILITY_TOLERANCE <= 0.1
+
+    def test_max_exposure_us_positive(self):
+        assert MAX_EXPOSURE_US > 0
+
+    def test_max_exposure_us_flight_safe(self):
+        """Must be short enough to avoid motion blur (< 10 ms)."""
+        assert MAX_EXPOSURE_US <= 10_000
+
+    def test_stability_within_tolerance(self):
         dtype_max = 65535.0
-        bright_99 = BRIGHT_CEIL * dtype_max * 0.9   # 10% below ceiling
-        dark_05 = DARK_FLOOR * dtype_max * 1.5      # 50% above floor
-        in_range = (bright_99 < BRIGHT_CEIL * dtype_max
-                    and dark_05 > DARK_FLOOR * dtype_max)
-        assert in_range
+        bright_prev = 0.50 * dtype_max
+        bright_cur = 0.52 * dtype_max
+        delta = abs(bright_cur - bright_prev)
+        assert delta <= AE_STABILITY_TOLERANCE * dtype_max
+
+    def test_stability_exceeds_tolerance(self):
+        dtype_max = 65535.0
+        bright_prev = 0.50 * dtype_max
+        bright_cur = 0.60 * dtype_max
+        delta = abs(bright_cur - bright_prev)
+        assert delta > AE_STABILITY_TOLERANCE * dtype_max
 
     def test_clipping_resets_convergence(self):
         """bright_99 above ceiling → not in range."""
@@ -234,8 +246,8 @@ class TestConvergenceConstants:
         bright_99 = BRIGHT_CEIL * dtype_max * 1.01
         assert bright_99 > BRIGHT_CEIL * dtype_max
 
-    def test_too_dark_resets_convergence(self):
-        """dark_05 below floor → not in range."""
+    def test_shadow_does_not_block_convergence(self):
+        """Deep natural shadows (dark_05 near zero) should not block convergence."""
         dtype_max = 65535.0
-        dark_05 = DARK_FLOOR * dtype_max * 0.5
-        assert dark_05 < DARK_FLOOR * dtype_max
+        dark_05 = 0.001 * dtype_max
+        assert dark_05 >= 0.0

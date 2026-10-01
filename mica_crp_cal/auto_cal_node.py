@@ -59,10 +59,12 @@ except ImportError:
 
 ALT_THRESHOLD_M = 3.0
 
-# Brightness targets (as fraction of dtype_max).
-BRIGHT_CEIL = 0.85   # 99th-pct of representative band must stay below this
-DARK_FLOOR = 0.05   # 5th-pct of representative band must stay above this
+# Brightness targets and AE stability (as fraction of dtype_max).
+BRIGHT_CEIL = 0.85              # 99th-pct of representative band must stay below this
+AE_STABILITY_TOLERANCE = 0.05   # Max frame-to-frame bright_99 change for AE convergence
 
+# Exposure limit: 5 ms gives < 1 px motion smear at 5 m/s with 0.03 m/px GSD.
+MAX_EXPOSURE_US = 5_000
 # Require this many consecutive in-bounds frames before declaring convergence.
 CONVERGE_FRAMES = 5
 
@@ -160,6 +162,11 @@ class AutoCalNode(Node):
 
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
+
+        self.declare_parameter("max_exposure_us", MAX_EXPOSURE_US)
+        self._max_exposure_us: int = int(
+            self.get_parameter("max_exposure_us").value
+        )
 
         self._above_alt = threading.Event()
         self._alt_notified = False
@@ -259,14 +266,16 @@ class AutoCalNode(Node):
         if self._force_cal:
             self.get_logger().info(
                 f"AutoCalNode ready — force_cal active, starting immediately. "
-                f"Convergence: {CONVERGE_FRAMES} stable frames in "
-                f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%]"
+                f"Convergence: {CONVERGE_FRAMES} stable frames with "
+                f"bright_99 < {BRIGHT_CEIL*100:.0f}%, delta <= {AE_STABILITY_TOLERANCE*100:.1f}%. "
+                f"Max exposure: {self._max_exposure_us} µs."
             )
         else:
             self.get_logger().info(
                 f"AutoCalNode ready — waiting for {ALT_THRESHOLD_M} m AGL. "
-                f"Convergence: {CONVERGE_FRAMES} stable frames in "
-                f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%]"
+                f"Convergence: {CONVERGE_FRAMES} stable frames with "
+                f"bright_99 < {BRIGHT_CEIL*100:.0f}%, delta <= {AE_STABILITY_TOLERANCE*100:.1f}%. "
+                f"Max exposure: {self._max_exposure_us} µs."
             )
 
     # -----------------------------------------------------------------------
@@ -334,23 +343,9 @@ class AutoCalNode(Node):
             for p, r in zip(params, result.results)
             if not r.successful
         ]
-        if not rejected:
-            return True
-
-        # The libcamera Raspberry Pi IPA returns successful=False for ExposureTime
-        # when ExposureTimeMode is also active, but the value IS applied anyway.
-        SPURIOUS = "ExposureTimeMode and ExposureTime must not be set simultaneously"
-        spurious = [(n, r) for n, r in rejected if SPURIOUS in r]
-        real = [(n, r) for n, r in rejected if SPURIOUS not in r]
-
-        if spurious:
-            self.get_logger().debug(
-                f"{cam}: ExposureTime returned successful=False due to "
-                f"ExposureTimeMode conflict, but value is applied — ignoring."
-            )
-        if real:
+        if rejected:
             sep = "=" * 62
-            details = "".join(f"    {name}: {reason}\n" for name, reason in real)
+            details = "".join(f"    {name}: {reason}\n" for name, reason in rejected)
             self.get_logger().error(
                 f"\n{sep}\n"
                 f"  CAMERA PARAMETER UPDATE REJECTED — {cam}\n"
@@ -415,21 +410,23 @@ class AutoCalNode(Node):
         (exposure_us, gain).
 
         Declares convergence once CONVERGE_FRAMES consecutive frames have
-        bright_99 < BRIGHT_CEIL and dark_05 > DARK_FLOOR. If convergence
-        doesn't happen within CONVERGE_TIMEOUT_S, locks at the current state.
+        bright_99 < BRIGHT_CEIL and frame-to-frame change <= AE_STABILITY_TOLERANCE.
+        If convergence doesn't happen within CONVERGE_TIMEOUT_S, locks at the
+        current state.
         """
         analyze = _analyze_cam0 if cam == "cam0" else _analyze_cam1
         dtype_max = 65535.0
         bright_thresh = BRIGHT_CEIL * dtype_max
-        dark_thresh = DARK_FLOOR * dtype_max
+        stability_thresh = AE_STABILITY_TOLERANCE * dtype_max
 
         consecutive = 0
+        prev_bright = None
         deadline = time.monotonic() + CONVERGE_TIMEOUT_S
 
         self.get_logger().info(
             f"{cam}: waiting for AE to converge "
-            f"({CONVERGE_FRAMES} consecutive frames in "
-            f"[{DARK_FLOOR*100:.0f}%, {BRIGHT_CEIL*100:.0f}%])"
+            f"({CONVERGE_FRAMES} consecutive frames with "
+            f"bright_99 < {BRIGHT_CEIL*100:.0f}%, delta <= {AE_STABILITY_TOLERANCE*100:.1f}%)"
         )
 
         while time.monotonic() < deadline:
@@ -440,23 +437,33 @@ class AutoCalNode(Node):
             bright_99, dark_05 = analyze(frame)
             self.get_logger().debug(
                 f"{cam}: bright_99={bright_99/dtype_max*100:.1f}%  "
-                f"dark_05={dark_05/dtype_max*100:.1f}%  "
                 f"stable={consecutive}/{CONVERGE_FRAMES}"
             )
 
-            if bright_99 < bright_thresh and dark_05 > dark_thresh:
-                consecutive += 1
-                if consecutive >= CONVERGE_FRAMES:
-                    self.get_logger().info(f"{cam}: AE converged")
-                    break
+            if bright_99 < bright_thresh:
+                if prev_bright is not None and abs(bright_99 - prev_bright) <= stability_thresh:
+                    consecutive += 1
+                    if consecutive >= CONVERGE_FRAMES:
+                        self.get_logger().info(f"{cam}: AE converged")
+                        break
+                else:
+                    if consecutive > 0:
+                        delta = abs(bright_99 - prev_bright) if prev_bright is not None else 0.0
+                        self.get_logger().debug(
+                            f"{cam}: stability reset — delta={delta/dtype_max*100:.1f}% > "
+                            f"{AE_STABILITY_TOLERANCE*100:.1f}%"
+                        )
+                    consecutive = 1
+                prev_bright = bright_99
             else:
                 if consecutive > 0:
                     self.get_logger().debug(
                         f"{cam}: stability reset — "
-                        f"bright_99={bright_99/dtype_max*100:.1f}%  "
-                        f"dark_05={dark_05/dtype_max*100:.1f}%"
+                        f"bright_99={bright_99/dtype_max*100:.1f}% >= "
+                        f"{BRIGHT_CEIL*100:.0f}%"
                     )
                 consecutive = 0
+                prev_bright = bright_99
         else:
             self.get_logger().warn(
                 f"{cam}: AE did not converge within {CONVERGE_TIMEOUT_S:.0f}s — "
@@ -464,6 +471,13 @@ class AutoCalNode(Node):
             )
 
         exp_us, gain = self._get_ae_params(cam)
+        if exp_us > self._max_exposure_us:
+            self.get_logger().warn(
+                f"{cam}: AE ExposureTime={exp_us} µs exceeds max_exposure_us="
+                f"{self._max_exposure_us} µs — clamping to prevent motion blur"
+            )
+            exp_us = self._max_exposure_us
+
         self.get_logger().info(
             f"{cam}: AE settled at ExposureTime={exp_us} µs  AnalogueGain={gain:.2f}×"
         )
@@ -495,7 +509,10 @@ class AutoCalNode(Node):
 
         for cam in ("cam0", "cam1"):
             exp_us, gain = self._wait_for_ae(cam)
+            if exp_us > self._max_exposure_us:
+                exp_us = self._max_exposure_us
             self._set_params(cam, [
+                _param("ExposureTimeMode", 1),
                 _param("AeEnable", False),
                 _param("ExposureTime", exp_us),
                 _param("AnalogueGain", gain),

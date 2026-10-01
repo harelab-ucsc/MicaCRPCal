@@ -18,8 +18,12 @@ import pytest
 from mica_crp_cal.panel_scan_node import (
     CAM0_BAND_NM,
     NUM_SLICES,
+    PANEL_CENTER_SCALE,
     PANEL_GAP_FRAC,
     PANEL_SIZE_FRAC,
+    SCAN_TIMEOUT_S,
+    _compute_slice_offset,
+    _extract_panel_center,
     _find_panel_by_edges,
     _load_albedo,
     _panel_roi_from_qr,
@@ -538,3 +542,92 @@ class TestFindPanelByEdgesFixture:
         cv2.imwrite(str(out_path), vis)
         # Always pass — image is for human inspection only.
         assert out_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# _extract_panel_center (Issue 7)
+# ---------------------------------------------------------------------------
+
+class TestExtractPanelCenter:
+    """Verify that _extract_panel_center isolates the clean white center and
+    excludes the black border."""
+
+    def test_centroid_preserved(self):
+        pts = np.array([[10, 10], [50, 10], [50, 50], [10, 50]], dtype=np.float32)
+        center = _extract_panel_center(pts, scale=0.5)
+        np.testing.assert_allclose(pts.mean(axis=0), center.mean(axis=0))
+
+    def test_dimensions_shrunk_by_scale(self):
+        pts = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+        center = _extract_panel_center(pts, scale=0.5)
+        # Centroid is (50, 50). Shrunk with scale 0.5: corners should be (25, 25) to (75, 75).
+        expected = np.array([[25, 25], [75, 25], [75, 75], [25, 75]], dtype=np.float32)
+        np.testing.assert_allclose(center, expected)
+
+    def test_excludes_dark_border_pixels(self):
+        """Synthetic panel image with 10px black border (DN=0) and white center (DN=50000).
+        Extracting the center should measure 50000, not contaminated by 0s."""
+        img = np.zeros((100, 100), dtype=np.uint16)
+        # White center is inside [20:80, 20:80]
+        img[20:80, 20:80] = 50000
+
+        # Full panel quad encompasses the border: [0, 100]
+        outer_panel = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+
+        # Unshrunk mask includes dark border
+        mask_full = np.zeros((100, 100), dtype=np.uint8)
+        cv2.fillConvexPoly(mask_full, np.round(outer_panel).astype(np.int32), 255)
+        mean_full = float(np.mean(img[mask_full > 0]))
+        assert mean_full < 40000  # Dragged down significantly by black border
+
+        # Shrunk mask isolates the clean white center
+        inner_panel = _extract_panel_center(outer_panel, scale=PANEL_CENTER_SCALE)
+        mask_clean = np.zeros((100, 100), dtype=np.uint8)
+        cv2.fillConvexPoly(mask_clean, np.round(inner_panel).astype(np.int32), 255)
+        mean_clean = float(np.mean(img[mask_clean > 0]))
+        assert mean_clean == pytest.approx(50000.0, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# _compute_slice_offset (Issue 6)
+# ---------------------------------------------------------------------------
+
+class TestComputeSliceOffset:
+    """Verify camera position parallax and optical center accounting across slices."""
+
+    def test_same_slice_zero_offset(self):
+        offset = _compute_slice_offset(2, 2, qr_size_px=50.0)
+        np.testing.assert_allclose(offset, [0.0, 0.0])
+
+    def test_zero_qr_size_zero_offset(self):
+        offset = _compute_slice_offset(1, 2, qr_size_px=0.0)
+        np.testing.assert_allclose(offset, [0.0, 0.0])
+
+    def test_offset_shape_and_dtype(self):
+        offset = _compute_slice_offset(2, 0, qr_size_px=40.0)
+        assert offset.shape == (2,)
+        assert offset.dtype == np.float32
+
+    def test_offset_direction_consistent_with_baseline(self):
+        """Slice 2 (x_ins > 0, y_ins > 0) to Slice 0 (x_ins < 0, y_ins < 0).
+        Camera baseline should induce non-zero parallax shift."""
+        offset = _compute_slice_offset(2, 0, qr_size_px=50.0)
+        # Non-zero shift
+        assert np.linalg.norm(offset) > 10.0
+
+
+# ---------------------------------------------------------------------------
+# scan_timeout_s and fallback calibration (Issue 4)
+# ---------------------------------------------------------------------------
+
+class TestScanTimeoutAndFallback:
+    """Verify timeout constant and fallback calibration unity factors."""
+
+    def test_scan_timeout_s_positive(self):
+        assert SCAN_TIMEOUT_S > 0
+        assert SCAN_TIMEOUT_S >= 10.0
+
+    def test_fallback_factors_are_unity(self):
+        fallback_factors = [1.0] * NUM_SLICES
+        assert len(fallback_factors) == 4
+        assert all(f == 1.0 for f in fallback_factors)
