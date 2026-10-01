@@ -89,9 +89,9 @@ QR_SIZE_M = 0.083
 #   multispec_3 (slice 2): (-0.021906, +0.021811)
 #   multispec_4 (slice 3): (-0.021906, -0.022001)
 CAM_OPTICAL_POS_M = (
-    np.array([ 0.021906, -0.022001], dtype=np.float32),  # slice 0 (450 nm)
-    np.array([ 0.021906,  0.021811], dtype=np.float32),  # slice 1 (695 nm)
-    np.array([-0.021906,  0.021811], dtype=np.float32),  # slice 2 (735 nm)
+    np.array([0.021906, -0.022001], dtype=np.float32),  # slice 0 (450 nm)
+    np.array([0.021906, 0.021811], dtype=np.float32),  # slice 1 (695 nm)
+    np.array([-0.021906, 0.021811], dtype=np.float32),  # slice 2 (735 nm)
     np.array([-0.021906, -0.022001], dtype=np.float32),  # slice 3 (850 nm)
 )
 
@@ -158,6 +158,7 @@ def _panel_roi_from_qr(pts: np.ndarray) -> np.ndarray:
 
     # Default to projecting below (original assumption); used as fallback.
     return _build(1, True)
+
 
 def _extract_panel_center(
     panel_pts: np.ndarray,
@@ -319,6 +320,7 @@ def _qreader_worker(in_q: mp.Queue, out_q: mp.Queue) -> None:
             except Exception:
                 pass
         out_q.put((frame_id, found_corners, found_slices, slice_corners))
+
 
 def _snap_to_corners(
     band: np.ndarray,
@@ -564,10 +566,13 @@ class PanelScanNode(Node):
                 res_id, qr_corners, detected_slices, slice_corners = res
             else:
                 res_id, qr_corners, detected_slices = res
-                slice_corners = {detected_slices[0]: qr_corners} if detected_slices and qr_corners is not None else {}
+                slice_corners = {
+                    detected_slices[0]: qr_corners} if detected_slices and qr_corners is not None else {}
 
             bboxes: list[np.ndarray | None] = [
-                slice_corners.get(i, qr_corners.reshape(1, 4, 2) if qr_corners is not None else None)
+                slice_corners.get(
+                    i, qr_corners.reshape(
+                        1, 4, 2) if qr_corners is not None else None)
                 for i in range(NUM_SLICES)
             ]
             hit = qr_corners is not None
@@ -589,6 +594,7 @@ class PanelScanNode(Node):
             if hits >= CONFIRM_HITS:
                 self._publish_calibration()
                 return
+
     def _watchdog(self) -> None:
         if self._done:
             return
@@ -630,6 +636,7 @@ class PanelScanNode(Node):
         self._pub.publish(msg)
         self._frame_buffer.clear()
         rclpy.shutdown()
+
     def _publish_calibration(self) -> None:
         self._done = True
 
@@ -808,4 +815,3 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-

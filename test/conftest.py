@@ -24,7 +24,8 @@ if 'rcl_interfaces.msg' in sys.modules:
         PARAMETER_STRING = 4
 
     class ParameterValue:
-        def __init__(self, type=0, bool_value=False, integer_value=0, double_value=0.0, string_value=""):
+        def __init__(self, type=0, bool_value=False, integer_value=0,
+                     double_value=0.0, string_value=""):
             self.type = type
             self.bool_value = bool_value
             self.integer_value = integer_value
