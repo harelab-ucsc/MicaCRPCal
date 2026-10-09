@@ -10,6 +10,9 @@ from rcl_interfaces.msg import ParameterType
 
 from mica_crp_cal.auto_cal_node import (
     AE_STABILITY_TOLERANCE,
+    ALT_MAX_M,
+    ALT_MIN_M,
+    ALT_THRESHOLD_M,
     BRIGHT_CEIL,
     CONVERGE_FRAMES,
     CONVERGE_TIMEOUT_S,
@@ -251,3 +254,34 @@ class TestConvergenceConstants:
         dtype_max = 65535.0
         dark_05 = 0.001 * dtype_max
         assert dark_05 >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Altitude gate
+# ---------------------------------------------------------------------------
+
+class TestAltitudeGate:
+    """Verify altitude gating logic and constants for auto-cal."""
+
+    def test_altitude_constants(self):
+        assert ALT_MIN_M == 3.5
+        assert ALT_MAX_M == 5.0
+        assert ALT_MIN_M < ALT_MAX_M
+        assert ALT_THRESHOLD_M == ALT_MIN_M
+
+    def test_altitude_within_gate(self):
+        alt = 4.2
+        assert ALT_MIN_M <= alt <= ALT_MAX_M
+
+    def test_altitude_at_boundaries(self):
+        assert ALT_MIN_M <= 3.5 <= ALT_MAX_M
+        assert ALT_MIN_M <= 5.0 <= ALT_MAX_M
+
+    def test_altitude_below_gate(self):
+        assert not (ALT_MIN_M <= 3.0 <= ALT_MAX_M)
+        assert not (ALT_MIN_M <= 0.0 <= ALT_MAX_M)
+        assert not (ALT_MIN_M <= -1.0 <= ALT_MAX_M)
+
+    def test_altitude_above_gate(self):
+        assert not (ALT_MIN_M <= 5.5 <= ALT_MAX_M)
+        assert not (ALT_MIN_M <= 10.0 <= ALT_MAX_M)

@@ -7,7 +7,7 @@ mock_modules = [
     'cv_bridge', 'sensor_msgs', 'sensor_msgs.msg',
     'std_msgs', 'std_msgs.msg',
     'rcl_interfaces', 'rcl_interfaces.msg', 'rcl_interfaces.srv',
-    'custom_msgs', 'custom_msgs.msg',
+    'ros2_radalt_msgs', 'ros2_radalt_msgs.msg',
     'as7265x_at_msgs', 'as7265x_at_msgs.msg',
     'qreader'
 ]

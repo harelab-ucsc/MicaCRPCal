@@ -44,10 +44,9 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray
 
 try:
-    from custom_msgs.msg import AltSNR
+    from ros2_radalt_msgs.msg import AltSNR
 except ImportError:
     AltSNR = None
-
 try:
     from as7265x_at_msgs.msg import AS7265xCal
 except ImportError:
@@ -57,7 +56,9 @@ except ImportError:
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-ALT_THRESHOLD_M = 3.0
+ALT_MIN_M = 3.5
+ALT_MAX_M = 5.0
+ALT_THRESHOLD_M = ALT_MIN_M  # Backwards compatibility alias
 
 # Brightness targets and AE stability (as fraction of dtype_max).
 BRIGHT_CEIL = 0.85              # 99th-pct of representative band must stay below this
@@ -167,6 +168,15 @@ class AutoCalNode(Node):
         self._max_exposure_us: int = int(
             self.get_parameter("max_exposure_us").value
         )
+        self.declare_parameter("alt_min_m", ALT_MIN_M)
+        self._alt_min_m: float = float(self.get_parameter("alt_min_m").value)
+
+        self.declare_parameter("alt_max_m", ALT_MAX_M)
+        self._alt_max_m: float = float(self.get_parameter("alt_max_m").value)
+
+        self.declare_parameter("radalt_topic", "/rad_altitude")
+        self._radalt_topic: str = str(self.get_parameter("radalt_topic").value)
+
 
         self._above_alt = threading.Event()
         self._alt_notified = False
@@ -224,11 +234,11 @@ class AutoCalNode(Node):
         # Subscriptions
         if AltSNR is not None:
             self.create_subscription(
-                AltSNR, "/rad_altitude", self._radalt_cb, _SNS_QOS
+                AltSNR, self._radalt_topic, self._radalt_cb, _SNS_QOS
             )
         else:
             self.get_logger().warn(
-                "custom_msgs not available — radalt sub disabled; "
+                "ros2_radalt_msgs not available — radalt sub disabled; "
                 "AutoCalNode will never trigger."
             )
 
@@ -272,7 +282,7 @@ class AutoCalNode(Node):
             )
         else:
             self.get_logger().info(
-                f"AutoCalNode ready — waiting for {ALT_THRESHOLD_M} m AGL. "
+                f"AutoCalNode ready — waiting for {self._alt_min_m:.1f}–{self._alt_max_m:.1f} m AGL. "
                 f"Convergence: {CONVERGE_FRAMES} stable frames with "
                 f"bright_99 < {BRIGHT_CEIL*100:.0f}%, delta <= {AE_STABILITY_TOLERANCE*100:.1f}%. "
                 f"Max exposure: {self._max_exposure_us} µs."
@@ -283,12 +293,12 @@ class AutoCalNode(Node):
     # -----------------------------------------------------------------------
 
     def _radalt_cb(self, msg) -> None:
-        if msg.altitude > ALT_THRESHOLD_M:
+        if self._alt_min_m <= msg.altitude <= self._alt_max_m:
             if not self._alt_notified:
                 self._alt_notified = True
                 self.get_logger().info(
-                    f"[AUTO-CAL] altitude gate cleared ({msg.altitude:.1f} m AGL >= "
-                    f"{ALT_THRESHOLD_M} m threshold) — triggering calibration"
+                    f"[AUTO-CAL] altitude gate cleared ({msg.altitude:.1f} m AGL in "
+                    f"[{self._alt_min_m:.1f}, {self._alt_max_m:.1f}] m window) — triggering calibration"
                 )
             self._above_alt.set()
 
@@ -490,19 +500,19 @@ class AutoCalNode(Node):
     def _cal_task(self) -> None:
         if not self._force_cal:
             self.get_logger().info(
-                f"auto_cal: waiting for drone to clear {ALT_THRESHOLD_M} m AGL "
+                f"auto_cal: waiting for drone to enter {self._alt_min_m:.1f}–{self._alt_max_m:.1f} m AGL "
                 "before locking exposure and capturing irradiance reference."
             )
         while not self._above_alt.wait(timeout=5.0):
             self.get_logger().warn(
-                f"auto_cal: still waiting for {ALT_THRESHOLD_M} m AGL — "
+                f"auto_cal: still waiting for {self._alt_min_m:.1f}–{self._alt_max_m:.1f} m AGL — "
                 "cameras are in auto-exposure mode, images are not yet being saved."
             )
         sep = "=" * 62
         self.get_logger().info(
             f"\n{sep}\n"
             f"  AUTO-CALIBRATION STARTING\n"
-            f"  Drone cleared {ALT_THRESHOLD_M} m AGL — locking cam0 + cam1 exposure\n"
+            f"  Drone entered {self._alt_min_m:.1f}–{self._alt_max_m:.1f} m AGL window — locking cam0 + cam1 exposure\n"
             f"  Images will NOT be saved until this completes.\n"
             f"{sep}"
         )
