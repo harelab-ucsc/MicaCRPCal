@@ -177,7 +177,6 @@ class AutoCalNode(Node):
         self.declare_parameter("radalt_topic", "/rad_altitude")
         self._radalt_topic: str = str(self.get_parameter("radalt_topic").value)
 
-
         self._above_alt = threading.Event()
         self._alt_notified = False
         if self._force_cal:
