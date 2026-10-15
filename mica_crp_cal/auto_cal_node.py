@@ -29,7 +29,6 @@ import time
 import numpy as np
 import rclpy
 import rclpy.executors
-from cv_bridge import CvBridge
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.node import Node
@@ -89,6 +88,34 @@ _SNS_QOS = QoSProfile(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _imgmsg_to_numpy(msg: Image) -> np.ndarray:
+    """Convert sensor_msgs/Image to numpy array without cv_bridge dependency."""
+    enc = msg.encoding.lower()
+    if "16" in enc or "r16" in enc or "16u" in enc:
+        dtype = np.dtype(np.uint16)
+    elif "32f" in enc or "float" in enc:
+        dtype = np.dtype(np.float32)
+    else:
+        dtype = np.dtype(np.uint8)
+
+    channels = 1
+    if "bgr" in enc or "rgb" in enc:
+        channels = 4 if ("8a" in enc or "16a" in enc) else 3
+
+    step = msg.step if msg.step > 0 else msg.width * dtype.itemsize * channels
+    arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, step))
+    row_bytes = msg.width * dtype.itemsize * channels
+    img = arr[:, :row_bytes].view(dtype)
+    if channels > 1:
+        img = img.reshape((msg.height, msg.width, channels))
+    else:
+        img = img.reshape((msg.height, msg.width))
+
+    if msg.is_bigendian and dtype.itemsize > 1:
+        img = img.byteswap().newbyteorder("<")
+
+    return img
+
 
 def _analyze_cam0(img: np.ndarray) -> tuple[float, float]:
     """Return (bright_99, dark_05) for the 735 nm band (slice 2).
@@ -159,7 +186,6 @@ class AutoCalNode(Node):
 
     def __init__(self):
         super().__init__("auto_cal")
-        self._bridge = CvBridge()
 
         self.declare_parameter("force_cal", False)
         self._force_cal: bool = self.get_parameter("force_cal").value
@@ -303,7 +329,7 @@ class AutoCalNode(Node):
 
     def _cam0_cb(self, msg: Image) -> None:
         try:
-            raw = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            raw = _imgmsg_to_numpy(msg)
         except Exception:
             return
         with self._cam0_lock:
@@ -312,13 +338,12 @@ class AutoCalNode(Node):
 
     def _cam1_cb(self, msg: Image) -> None:
         try:
-            raw = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            raw = _imgmsg_to_numpy(msg)
         except Exception:
             return
         with self._cam1_lock:
             self._cam1_frame = raw
         self._cam1_evt.set()
-
     def _spec_cb(self, msg) -> None:
         with self._spec_lock:
             self._latest_spec = list(msg.values)

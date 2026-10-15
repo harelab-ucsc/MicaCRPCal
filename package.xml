@@ -12,7 +12,6 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>cv_bridge</exec_depend>
   <exec_depend>as7265x_at_msgs</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>ros2_radalt_msgs</exec_depend>

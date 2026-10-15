@@ -27,6 +27,7 @@ from mica_crp_cal.panel_scan_node import (
     _find_panel_by_edges,
     _load_albedo,
     _panel_roi_from_qr,
+    _imgmsg_to_numpy,
 )
 
 _FIXTURE_DIR = Path(__file__).parent / "data"
@@ -631,3 +632,57 @@ class TestScanTimeoutAndFallback:
         fallback_factors = [1.0] * NUM_SLICES
         assert len(fallback_factors) == 4
         assert all(f == 1.0 for f in fallback_factors)
+
+# ---------------------------------------------------------------------------
+# _imgmsg_to_numpy (cv_bridge replacement)
+# ---------------------------------------------------------------------------
+
+class _MockImage:
+    def __init__(self, data: bytes, height: int, width: int, step: int, encoding: str, is_bigendian: int = 0):
+        self.data = data
+        self.height = height
+        self.width = width
+        self.step = step
+        self.encoding = encoding
+        self.is_bigendian = is_bigendian
+
+
+class TestImgmsgToNumpy:
+    def test_mono16_unpadded(self):
+        orig = np.arange(800 * 1280, dtype=np.uint16).reshape((800, 1280))
+        msg = _MockImage(orig.tobytes(), 800, 1280, 1280 * 2, "mono16")
+        res = _imgmsg_to_numpy(msg)
+        assert res.dtype == np.uint16
+        assert res.shape == (800, 1280)
+        np.testing.assert_array_equal(res, orig)
+
+    def test_mono16_padded_step(self):
+        orig = np.arange(800 * 1280, dtype=np.uint16).reshape((800, 1280))
+        padded = np.zeros((800, 1280 * 2 + 32), dtype=np.uint8)
+        padded[:, :1280 * 2] = orig.view(np.uint8).reshape((800, 1280 * 2))
+        msg = _MockImage(padded.tobytes(), 800, 1280, 1280 * 2 + 32, "mono16")
+        res = _imgmsg_to_numpy(msg)
+        assert res.dtype == np.uint16
+        assert res.shape == (800, 1280)
+        np.testing.assert_array_equal(res, orig)
+
+    def test_mono8(self):
+        orig = np.random.randint(0, 255, (800, 1280), dtype=np.uint8)
+        msg = _MockImage(orig.tobytes(), 800, 1280, 1280, "mono8")
+        res = _imgmsg_to_numpy(msg)
+        assert res.dtype == np.uint8
+        np.testing.assert_array_equal(res, orig)
+
+    def test_zero_step_fallback(self):
+        orig = np.ones((800, 1280), dtype=np.uint16) * 1234
+        msg = _MockImage(orig.tobytes(), 800, 1280, 0, "mono16")
+        res = _imgmsg_to_numpy(msg)
+        assert res.shape == (800, 1280)
+        np.testing.assert_array_equal(res, orig)
+
+    def test_rgb8_multichannel(self):
+        orig = np.random.randint(0, 255, (100, 200, 3), dtype=np.uint8)
+        msg = _MockImage(orig.tobytes(), 100, 200, 200 * 3, "rgb8")
+        res = _imgmsg_to_numpy(msg)
+        assert res.shape == (100, 200, 3)
+        np.testing.assert_array_equal(res, orig)

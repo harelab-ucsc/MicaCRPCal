@@ -46,7 +46,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
@@ -110,6 +109,34 @@ _LATCHED_QOS = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
     depth=1,
 )
+
+def _imgmsg_to_numpy(msg: Image) -> np.ndarray:
+    """Convert sensor_msgs/Image to numpy array without cv_bridge dependency."""
+    enc = msg.encoding.lower()
+    if "16" in enc or "r16" in enc or "16u" in enc:
+        dtype = np.dtype(np.uint16)
+    elif "32f" in enc or "float" in enc:
+        dtype = np.dtype(np.float32)
+    else:
+        dtype = np.dtype(np.uint8)
+
+    channels = 1
+    if "bgr" in enc or "rgb" in enc:
+        channels = 4 if ("8a" in enc or "16a" in enc) else 3
+
+    step = msg.step if msg.step > 0 else msg.width * dtype.itemsize * channels
+    arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, step))
+    row_bytes = msg.width * dtype.itemsize * channels
+    img = arr[:, :row_bytes].view(dtype)
+    if channels > 1:
+        img = img.reshape((msg.height, msg.width, channels))
+    else:
+        img = img.reshape((msg.height, msg.width))
+
+    if msg.is_bigendian and dtype.itemsize > 1:
+        img = img.byteswap().newbyteorder("<")
+
+    return img
 
 
 def _load_albedo(csv_path: str | Path, wavelengths_nm: tuple) -> list:
@@ -385,7 +412,6 @@ class PanelScanNode(Node):
 
     def __init__(self):
         super().__init__("panel_scan")
-        self._bridge = CvBridge()
         self._window: deque = deque(maxlen=WINDOW_SIZE)
         self._frame_id: int = 0
         self._frame_buffer: dict[int, np.ndarray] = {}  # Dictionary buffer indexed by frame_id
@@ -506,10 +532,10 @@ class PanelScanNode(Node):
             return
 
         try:
-            raw = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            raw = _imgmsg_to_numpy(msg)
         except Exception as ex:
             self.get_logger().warn(
-                f"imgmsg_to_cv2 failed: {ex}", throttle_duration_sec=5.0
+                f"Image decode failed: {ex}", throttle_duration_sec=5.0
             )
             return
 
