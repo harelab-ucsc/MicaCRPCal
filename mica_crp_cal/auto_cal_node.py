@@ -344,6 +344,7 @@ class AutoCalNode(Node):
         with self._cam1_lock:
             self._cam1_frame = raw
         self._cam1_evt.set()
+
     def _spec_cb(self, msg) -> None:
         with self._spec_lock:
             self._latest_spec = list(msg.values)

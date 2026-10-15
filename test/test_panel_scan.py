@@ -637,8 +637,10 @@ class TestScanTimeoutAndFallback:
 # _imgmsg_to_numpy (cv_bridge replacement)
 # ---------------------------------------------------------------------------
 
+
 class _MockImage:
-    def __init__(self, data: bytes, height: int, width: int, step: int, encoding: str, is_bigendian: int = 0):
+    def __init__(self, data: bytes, height: int, width: int,
+                 step: int, encoding: str, is_bigendian: int = 0):
         self.data = data
         self.height = height
         self.width = width

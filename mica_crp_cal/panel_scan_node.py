@@ -110,6 +110,7 @@ _LATCHED_QOS = QoSProfile(
     depth=1,
 )
 
+
 def _imgmsg_to_numpy(msg: Image) -> np.ndarray:
     """Convert sensor_msgs/Image to numpy array without cv_bridge dependency."""
     enc = msg.encoding.lower()
