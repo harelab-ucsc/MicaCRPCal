@@ -82,16 +82,17 @@ QR_SIZE_M = 0.083
 
 # Camera optical positions (X_opt, Y_opt) in meters relative to rig center.
 # Optical frame: X=right, Y=down, looking nadir.
-# Derived from CAD / sensor_params/birdseye_v2_camchain_intrinsics.yaml:
-#   multispec_1 (slice 0): (+0.021906, -0.022001)
-#   multispec_2 (slice 1): (+0.021906, +0.021811)
-#   multispec_3 (slice 2): (-0.021906, +0.021811)
-#   multispec_4 (slice 3): (-0.021906, -0.022001)
+# Derived from sensor_params/birdseye_v2_camchain_intrinsics.yaml:
+#   R_cam_ins rotates INS frame into optical frame: X_opt = Y_ins, Y_opt = -X_ins
+#   multispec_1 (slice 0): (-0.021906, +0.022001)
+#   multispec_2 (slice 1): (-0.021906, -0.021811)
+#   multispec_3 (slice 2): (+0.021906, -0.021811)
+#   multispec_4 (slice 3): (+0.021906, +0.022001)
 CAM_OPTICAL_POS_M = (
-    np.array([0.021906, -0.022001], dtype=np.float32),  # slice 0 (450 nm)
-    np.array([0.021906, 0.021811], dtype=np.float32),  # slice 1 (695 nm)
-    np.array([-0.021906, 0.021811], dtype=np.float32),  # slice 2 (735 nm)
-    np.array([-0.021906, -0.022001], dtype=np.float32),  # slice 3 (850 nm)
+    np.array([-0.021906, 0.022001], dtype=np.float32),  # slice 0 (450 nm)
+    np.array([-0.021906, -0.021811], dtype=np.float32),  # slice 1 (695 nm)
+    np.array([0.021906, -0.021811], dtype=np.float32),  # slice 2 (735 nm)
+    np.array([0.021906, 0.022001], dtype=np.float32),  # slice 3 (850 nm)
 )
 
 # Optical centers (cx, cy) in pixels from calibration:
@@ -237,6 +238,7 @@ def _find_panel_by_edges(
     band: np.ndarray,
     hint_center: tuple | None = None,
     hint_radius: float | None = None,
+    min_dist_from_hint: float | None = None,
 ) -> np.ndarray | None:
     """Locate the reflective panel ROI via edge detection and contour analysis.
 
@@ -284,10 +286,13 @@ def _find_panel_by_edges(
         if max(rw, rh) / min(rw, rh) > 2.0:
             continue
 
-        if hint_center is not None and hint_radius is not None:
+        if hint_center is not None:
             cx, cy = rect[0]
             dx, dy = cx - hint_center[0], cy - hint_center[1]
-            if dx * dx + dy * dy > hint_radius ** 2:
+            dist_sq = dx * dx + dy * dy
+            if hint_radius is not None and dist_sq > hint_radius ** 2:
+                continue
+            if min_dist_from_hint is not None and dist_sq < min_dist_from_hint ** 2:
                 continue
 
         box = cv2.boxPoints(rect).astype(np.float32)
@@ -690,25 +695,34 @@ class PanelScanNode(Node):
         ref_slice = 2   # 735 nm band has best contrast for edge detection
         src_slice = detected_slices[0] if detected_slices else ref_slice
 
-        qr_size = float(max(
-            qr_pts[:, 0].max() - qr_pts[:, 0].min(),
-            qr_pts[:, 1].max() - qr_pts[:, 1].min(),
-        ))
+        # Use directly detected corners for ref_slice if available, else project from src_slice
+        if ref_slice in self._last_slice_corners:
+            qr_pts_ref = self._last_slice_corners[ref_slice]
+            qr_size = float(max(
+                qr_pts_ref[:, 0].max() - qr_pts_ref[:, 0].min(),
+                qr_pts_ref[:, 1].max() - qr_pts_ref[:, 1].min(),
+            ))
+        else:
+            qr_size = float(max(
+                qr_pts[:, 0].max() - qr_pts[:, 0].min(),
+                qr_pts[:, 1].max() - qr_pts[:, 1].min(),
+            ))
+            offset_to_ref = _compute_slice_offset(src_slice, ref_slice, qr_size)
+            qr_pts_ref = qr_pts + offset_to_ref
 
-        # Shift QR coordinates to ref_slice if detected in a different slice
-        offset_to_ref = _compute_slice_offset(src_slice, ref_slice, qr_size)
-        qr_pts_ref = qr_pts + offset_to_ref
         qr_cx_ref = float(qr_pts_ref[:, 0].mean())
         qr_cy_ref = float(qr_pts_ref[:, 1].mean())
 
         # Use the 735 nm slice (best contrast) to find the panel via edge
         # detection. Search within 3× the QR bounding-box width of the QR
-        # centre so we don't pick up a bright object elsewhere in the scene.
+        # centre, but exclude candidates within 0.6× QR size so the QR code
+        # itself is not mistaken for the panel.
         ref_band = raw[:, ref_slice * slice_w: (ref_slice + 1) * slice_w]
         projected_panel = _find_panel_by_edges(
             ref_band,
             hint_center=(qr_cx_ref, qr_cy_ref),
             hint_radius=qr_size * 3.0,
+            min_dist_from_hint=qr_size * 0.6,
         )
         if projected_panel is None:
             self.get_logger().warn(
@@ -724,10 +738,15 @@ class PanelScanNode(Node):
             band_u8 = cv2.normalize(band, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8) \
                 if band.dtype != np.uint8 else band
 
-            # Account for camera positions: compute offset from reference slice to slice i
-            offset_i = _compute_slice_offset(ref_slice, i, qr_size)
-            panel_proj_i = projected_panel + offset_i
-
+            # If this slice directly detected the QR code, align panel ROI to its detected QR center;
+            # otherwise, shift via camera optical baseline parallax.
+            if i in self._last_slice_corners and i != ref_slice:
+                qr_i = self._last_slice_corners[i]
+                panel_rel = projected_panel - qr_pts_ref.mean(axis=0)
+                panel_proj_i = qr_i.mean(axis=0) + panel_rel
+            else:
+                offset_i = _compute_slice_offset(ref_slice, i, qr_size)
+                panel_proj_i = projected_panel + offset_i
             panel_pts = _snap_to_corners(band_u8, panel_proj_i)
             per_slice_panels.append(panel_pts)
 
@@ -817,9 +836,10 @@ class PanelScanNode(Node):
                 cv2.polylines(vis_bgr, [np.round(center_global).astype(np.int32)],
                               isClosed=True, color=(0, 255, 255), thickness=2)
 
-                # QR box only where it was actually detected.
+                # QR box only where it was actually detected (using slice-specific corners when available).
                 if i in detected:
-                    qr_global = qr_pts.copy()
+                    qr_i = self._last_slice_corners.get(i, qr_pts)
+                    qr_global = qr_i.copy()
                     qr_global[:, 0] += x_off
                     cv2.polylines(vis_bgr, [np.round(qr_global).astype(np.int32)],
                                   isClosed=True, color=(0, 255, 0), thickness=4)

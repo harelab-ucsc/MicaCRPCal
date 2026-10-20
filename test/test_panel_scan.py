@@ -502,6 +502,18 @@ class TestFindPanelByEdgesFixture:
             "_find_panel_by_edges returned None without a position hint"
         )
 
+    def test_min_dist_from_hint_excludes_overlapping_square(self):
+        """Candidates centered at the QR code must be excluded by min_dist_from_hint."""
+        gray = np.zeros((400, 400), dtype=np.uint8)
+        # Bright square at (100, 100)
+        cv2.rectangle(gray, (80, 80), (120, 120), 255, -1)
+        # Another square at (200, 100)
+        cv2.rectangle(gray, (180, 80), (220, 120), 200, -1)
+        res = _find_panel_by_edges(gray, hint_center=(100, 100), hint_radius=150.0, min_dist_from_hint=50.0)
+        assert res is not None
+        cx = res[:, 0].mean()
+        assert cx > 150.0
+
     def test_save_annotated_image(self, tmp_path):
         """Draw QR centre and detected panel ROI on the fixture image and save
         the annotated composite to test-artifacts/panel_detection_annotated.png.
@@ -615,6 +627,12 @@ class TestComputeSliceOffset:
         offset = _compute_slice_offset(2, 0, qr_size_px=50.0)
         # Non-zero shift
         assert np.linalg.norm(offset) > 10.0
+
+    def test_baseline_parallax_shifts_in_correct_direction(self):
+        """Slice 1 (multispec_2) to Slice 2 (multispec_3) moves in -X optical direction."""
+        offset = _compute_slice_offset(1, 2, qr_size_px=50.0)
+        # X offset must be negative (multispec_3 is +X in optical frame, so scene shifts -X)
+        assert offset[0] < 0.0
 
 
 # ---------------------------------------------------------------------------
