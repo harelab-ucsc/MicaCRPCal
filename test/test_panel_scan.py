@@ -509,7 +509,13 @@ class TestFindPanelByEdgesFixture:
         cv2.rectangle(gray, (80, 80), (120, 120), 255, -1)
         # Another square at (200, 100)
         cv2.rectangle(gray, (180, 80), (220, 120), 200, -1)
-        res = _find_panel_by_edges(gray, hint_center=(100, 100), hint_radius=150.0, min_dist_from_hint=50.0)
+        res = _find_panel_by_edges(
+            gray,
+            hint_center=(
+                100,
+                100),
+            hint_radius=150.0,
+            min_dist_from_hint=50.0)
         assert res is not None
         cx = res[:, 0].mean()
         assert cx > 150.0

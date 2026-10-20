@@ -836,7 +836,8 @@ class PanelScanNode(Node):
                 cv2.polylines(vis_bgr, [np.round(center_global).astype(np.int32)],
                               isClosed=True, color=(0, 255, 255), thickness=2)
 
-                # QR box only where it was actually detected (using slice-specific corners when available).
+                # QR box only where it was actually detected (using slice-specific corners
+                # when available).
                 if i in detected:
                     qr_i = self._last_slice_corners.get(i, qr_pts)
                     qr_global = qr_i.copy()
