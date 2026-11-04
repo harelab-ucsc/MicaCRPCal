@@ -13,7 +13,7 @@ This guarantees the panel is imaged at the same ExposureTime and AnalogueGain
 used for all flight images — critical because mean_panel_DN encodes the
 exposure time and a mismatch would scale all reflectance values incorrectly.
 
-The 30-second scan window starts when /cal/exposure_locked is received.
+The 60-second scan window starts when /cal/exposure_locked is received.
 Place the CRP panel flat on the ground directly below the hovering drone.
 
 Algorithm
@@ -71,7 +71,7 @@ PANEL_SIZE_FRAC = 1.205
 # Default scan timeout (seconds). If no QR code is confirmed within this window
 # after /cal/exposure_locked, fallback unity calibration factors [1.0, 1.0, 1.0, 1.0]
 # are published on /panel_cal/irradiance so stream_processor does not discard the flight.
-SCAN_TIMEOUT_S = 30.0
+SCAN_TIMEOUT_S = 60.0
 
 # Linear scale factor to isolate the clean white center of the CRP panel,
 # excluding the black border and target mounting edges (0.5 = central 50% linear / 25% area).
@@ -309,7 +309,7 @@ def _find_panel_by_edges(
     return best_roi
 
 
-_QR_UPSCALE = 2          # upscale factor passed to QReader to improve small-QR detection
+_QR_UPSCALE = 3          # upscale factor passed to QReader to improve small-QR detection
 _QR_MIN_CONFIDENCE = 0.3  # lower than default 0.5 — we're far away, accept weaker hits
 
 
@@ -527,7 +527,7 @@ class PanelScanNode(Node):
         self._qr_proc.start()
 
         self.get_logger().info(
-            "Exposure locked — panel scan window open. "
+            "Exposure locked — panel scan window open (60 s). "
             "Place the CRP panel flat on the ground directly below the drone "
             "with the QR tag visible. Panel must be in direct sunlight with "
             "NO shadow on the reflective surface."

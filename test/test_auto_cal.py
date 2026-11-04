@@ -264,24 +264,24 @@ class TestAltitudeGate:
     """Verify altitude gating logic and constants for auto-cal."""
 
     def test_altitude_constants(self):
-        assert ALT_MIN_M == 3.5
-        assert ALT_MAX_M == 5.0
+        assert ALT_MIN_M == 1.2
+        assert ALT_MAX_M == 2.0
         assert ALT_MIN_M < ALT_MAX_M
         assert ALT_THRESHOLD_M == ALT_MIN_M
 
     def test_altitude_within_gate(self):
-        alt = 4.2
+        alt = 1.5
         assert ALT_MIN_M <= alt <= ALT_MAX_M
 
     def test_altitude_at_boundaries(self):
-        assert ALT_MIN_M <= 3.5 <= ALT_MAX_M
-        assert ALT_MIN_M <= 5.0 <= ALT_MAX_M
+        assert ALT_MIN_M <= 1.2 <= ALT_MAX_M
+        assert ALT_MIN_M <= 2.0 <= ALT_MAX_M
 
     def test_altitude_below_gate(self):
-        assert not (ALT_MIN_M <= 3.0 <= ALT_MAX_M)
+        assert not (ALT_MIN_M <= 1.0 <= ALT_MAX_M)
         assert not (ALT_MIN_M <= 0.0 <= ALT_MAX_M)
         assert not (ALT_MIN_M <= -1.0 <= ALT_MAX_M)
 
     def test_altitude_above_gate(self):
-        assert not (ALT_MIN_M <= 5.5 <= ALT_MAX_M)
+        assert not (ALT_MIN_M <= 2.5 <= ALT_MAX_M)
         assert not (ALT_MIN_M <= 10.0 <= ALT_MAX_M)

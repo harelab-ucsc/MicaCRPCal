@@ -1,7 +1,7 @@
 """
-AutoCalNode — automatic exposure lock and irradiance calibration at 3 m AGL.
+AutoCalNode — automatic exposure lock and irradiance calibration at 1.2–2.0 m AGL.
 
-Waits until the drone clears ALT_THRESHOLD_M (radalt), then:
+Waits until the drone enters ALT_MIN_M–ALT_MAX_M (radalt), then:
 
   1. Waits for libcamera's built-in AE/AGC to converge: CONVERGE_FRAMES
      consecutive frames where the 99th-pct DN of the representative band
@@ -55,8 +55,8 @@ except ImportError:
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-ALT_MIN_M = 3.5
-ALT_MAX_M = 5.0
+ALT_MIN_M = 1.2
+ALT_MAX_M = 2.0
 ALT_THRESHOLD_M = ALT_MIN_M  # Backwards compatibility alias
 
 # Brightness targets and AE stability (as fraction of dtype_max).
