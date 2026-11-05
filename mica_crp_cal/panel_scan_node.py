@@ -853,6 +853,28 @@ class PanelScanNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to save debug image: {e}")
 
+    def destroy_node(self):
+        if getattr(self, "_qr_proc", None) is not None:
+            if self._qr_proc.is_alive():
+                self._qr_proc.terminate()
+                self._qr_proc.join(timeout=1.0)
+            self._qr_proc = None
+        if getattr(self, "_qr_in", None) is not None:
+            try:
+                self._qr_in.close()
+                self._qr_in.cancel_join_thread()
+            except Exception:
+                pass
+            self._qr_in = None
+        if getattr(self, "_qr_out", None) is not None:
+            try:
+                self._qr_out.close()
+                self._qr_out.cancel_join_thread()
+            except Exception:
+                pass
+            self._qr_out = None
+        super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -863,3 +885,5 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
